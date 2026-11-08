@@ -13,6 +13,22 @@ from backend.services.accounts import create_account
 from backend.services.ledger import create_transaction
 
 
+@pytest.mark.parametrize(
+    ("note", "due", "minimum", "estimate"),
+    [
+        ("Sao kê 26/10 — hạn trả 15/11/2026 (tối thiểu 153.974đ)", "2026-11-15", 153_974, False),
+        ("ước tính, hạn thanh toán 03/11", "2026-11-03", None, True),  # no year: this year, overdue stays overdue
+        ("hạn trả 31/02/2026", None, None, False),
+        ("trả tự động từ MB", None, None, False),
+    ],
+)
+def test_card_due_date_and_minimum_come_from_the_note(note, due, minimum, estimate) -> None:
+    from datetime import date
+
+    info = hub_push._card_info(note, date(2026, 11, 8))
+    assert (info["dueDate"], info["minPayment"], info["estimate"]) == (due, minimum, estimate)
+
+
 def _book() -> None:
     from backend.db.profile_store import ProfileStore
 

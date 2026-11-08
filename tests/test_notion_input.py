@@ -793,7 +793,7 @@ async def test_a_transfer_row_moves_money_between_the_two_accounts(notion: FakeN
     tracked_from_november(notion)
     await notion_input.sync_notion_input()
     notion.data[TX].append(
-        row("tx-xfer", "Rút tiền", "2026-11-08", moved=1_000_000, bank="page-bank", to="page-save")
+        row("tx-xfer", "Rút tiền", "2026-11-12", moved=1_000_000, bank="page-bank", to="page-save")
     )
 
     result = await notion_input.sync_notion_input()
@@ -1082,3 +1082,187 @@ async def test_a_cap_nhat_before_the_tracking_start_books_at_the_start(notion: F
     (adjust,) = adjustments()
     assert (adjust["date"], adjust["to_amount"]) == ("2026-11-20", 1_000_000)
     assert balance_of("Sổ tiết kiệm") == 101_000_000
+
+
+# ── Review fixes ──
+
+
+def _previous_version(monkeypatch):
+    """The sync as the family's book was built with it, before transfers, deletions and Số dư."""
+    import importlib.util
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    source = subprocess.check_output(
+        ["git", "show", "709a5693~1:backend/services/notion_input.py"], cwd=root
+    )
+    target = Path(__import__("tempfile").mkdtemp()) / "old_notion_input.py"
+    target.write_bytes(source)
+    spec = importlib.util.spec_from_file_location("old_notion_input", target)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "user_today", lambda: date(2026, 11, 20))
+    return module
+
+
+async def test_upgrade_does_not_count_old_transfers_twice(notion: FakeNotion, monkeypatch) -> None:
+    old = _previous_version(monkeypatch)
+    edit(notion, ACCOUNT, "page-save", **{"Cập nhật": when("2026-11-10")})
+    notion.data[TX] += [
+        row("tx-interest", "Lãi", "2026-11-02", thu=100_000, bank="page-save"),
+        # moved before both Cập nhật: Notion's Số dư 10M / 100M already count it
+        row("tx-xfer", "Rút tiền", "2026-11-08", moved=1_000_000, bank="page-bank", to="page-save"),
+        row("tx-later", "Gửi thêm", "2026-11-15", moved=500_000, bank="page-bank", to="page-save"),
+    ]
+    old._apply({kind: list(notion.data[src]) for kind, src in notion_input.DATA_SOURCES.items()})
+    assert (balance_of("Ngân hàng"), balance_of("Sổ tiết kiệm")) == (10_000_000, 100_000_000)
+
+    result = await notion_input.sync_notion_input()
+
+    # The 8/11 transfer is inside both Số dư; the 15/11 one is after them and is real.
+    assert set(imported()) >= {"Gửi thêm"} and "Rút tiền" not in imported()
+    assert result["transactions"]["created"] == 1
+    assert (balance_of("Ngân hàng"), balance_of("Sổ tiết kiệm")) == (9_500_000, 100_500_000)
+    again = await notion_input.sync_notion_input()
+    assert again["transactions"]["created"] == 0
+    assert (balance_of("Ngân hàng"), balance_of("Sổ tiết kiệm")) == (9_500_000, 100_500_000)
+
+
+async def test_a_transfer_dated_before_a_known_cap_nhat_is_not_booked_again(
+    notion: FakeNotion,
+) -> None:
+    await notion_input.sync_notion_input()
+
+    notion.data[TX].append(
+        row("tx-old", "Rút tiền", "2026-11-08", moved=1_000_000, bank="page-bank", to="page-save")
+    )
+    await notion_input.sync_notion_input()
+
+    assert "Rút tiền" not in imported()
+    assert balance_of("Ngân hàng") == 10_000_000  # Số dư of 10/11 already says so
+
+
+async def test_a_row_restored_in_notion_comes_back(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    lunch = next(p for p in notion.data[TX] if p["id"] == "tx-lunch")
+    notion.data[TX].remove(lunch)
+    assert (await notion_input.sync_notion_input())["transactions"]["deleted"] == 1
+
+    notion.data[TX].append(lunch)  # restored: same page id, same content
+    back = await notion_input.sync_notion_input()
+
+    assert back["transactions"]["created"] == 1
+    assert "Cơm trưa" in imported()
+    assert balance_of("Ngân hàng") == 10_000_000
+
+
+async def test_a_row_typed_after_its_so_du_is_not_counted_twice(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    edit(
+        notion, ACCOUNT, "page-bank", **{"Số dư": number(9_500_000), "Cập nhật": when("2026-11-12")}
+    )
+    await notion_input.sync_notion_input()
+    assert balance_of("Ngân hàng") == 9_500_000  # one -500k adjustment
+
+    notion.data[TX].append(row("tx-shop", "Mua sắm", "2026-11-11", chi=500_000, bank="page-bank"))
+    result = await notion_input.sync_notion_input()
+
+    assert balance_of("Ngân hàng") == 9_500_000  # Notion still says 9.5M
+    assert result["accounts"]["reconciled"] == 1 and adjustments() == []
+    assert (await notion_input.sync_notion_input())["accounts"]["reconciled"] == 0
+
+
+async def test_deleting_a_duplicate_after_so_du_was_corrected(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    notion.data[TX].append(
+        row("tx-dup", "Cơm trưa", "2026-11-11", chi=50_000, bank="page-bank", env="page-food")
+    )
+    await notion_input.sync_notion_input()
+    edit(
+        notion,
+        ACCOUNT,
+        "page-bank",
+        **{"Số dư": number(10_000_000), "Cập nhật": when("2026-11-12")},
+    )
+    await notion_input.sync_notion_input()
+    assert balance_of("Ngân hàng") == 10_000_000  # a +50k adjustment covers the duplicate
+
+    notion.data[TX] = [p for p in notion.data[TX] if p["id"] != "tx-dup"]
+    await notion_input.sync_notion_input()
+
+    assert balance_of("Ngân hàng") == 10_000_000  # Notion still says 10M
+    assert adjustments() == []
+
+
+async def test_fixing_a_cap_nhat_typo_books_no_second_adjustment(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    edit(
+        notion,
+        ACCOUNT,
+        "page-bank",
+        **{"Số dư": number(10_500_000), "Cập nhật": when("2026-11-12")},
+    )
+    await notion_input.sync_notion_input()
+
+    edit(notion, ACCOUNT, "page-bank", **{"Cập nhật": when("2026-11-11")})  # meant the 11th
+    await notion_input.sync_notion_input()
+
+    assert balance_of("Ngân hàng") == 10_500_000
+    assert [(a["date"], a["to_amount"]) for a in adjustments()] == [("2026-11-11", 500_000)]
+
+
+async def test_a_transfer_to_an_account_deleted_here_moves_no_money(notion: FakeNotion) -> None:
+    notion.data[TX] = [p for p in notion.data[TX] if p["id"] != "tx-gift"]  # no catch-all yet
+    await notion_input.sync_notion_input()
+    ledger_service.delete_account(accounts_by_name()["Sổ tiết kiệm"]["id"], force=True)
+
+    notion.data[TX].append(
+        row(
+            "tx-xfer",
+            "Gửi tiết kiệm",
+            "2026-11-15",
+            moved=1_000_000,
+            bank="page-bank",
+            to="page-save",
+        )
+    )
+    await notion_input.sync_notion_input()
+
+    assert "Notion" not in accounts_by_name()  # its leg is not a reason to open the catch-all
+    assert "Gửi tiết kiệm" not in imported()
+    assert balance_of("Ngân hàng") == 10_000_000
+
+
+async def test_a_new_account_funded_from_an_account_deleted_here_reads_its_so_du(
+    notion: FakeNotion,
+) -> None:
+    await notion_input.sync_notion_input()
+    ledger_service.delete_account(accounts_by_name()["Sổ tiết kiệm"]["id"], force=True)
+
+    notion.data[ACCOUNT].append(
+        account("page-momo", "Ví MoMo", "Ví điện tử", 1_000_000, "2026-11-16")
+    )
+    notion.data[TX].append(
+        row("tx-topup", "Nạp ví", "2026-11-15", moved=1_000_000, bank="page-save", to="page-momo")
+    )
+    await notion_input.sync_notion_input()
+
+    assert balance_of("Ví MoMo") == 1_000_000  # Notion: 1M
+
+
+async def test_a_new_account_is_opened_to_its_so_du_when_its_transfer_is_already_counted(
+    notion: FakeNotion,
+) -> None:
+    await notion_input.sync_notion_input()
+
+    notion.data[ACCOUNT].append(
+        account("page-momo", "Ví MoMo", "Ví điện tử", 1_000_000, "2026-11-16")
+    )
+    notion.data[TX].append(
+        row("tx-topup", "Nạp ví", "2026-11-08", moved=1_000_000, bank="page-bank", to="page-momo")
+    )
+    await notion_input.sync_notion_input()
+
+    assert "Nạp ví" not in imported()  # inside the bank's Số dư of 10/11
+    assert (balance_of("Ví MoMo"), balance_of("Ngân hàng")) == (1_000_000, 10_000_000)

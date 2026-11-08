@@ -10,14 +10,15 @@ Off unless ``CHILLY_HUB_URL`` and ``CHILLY_HUB_PUSH_KEY`` are both set.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+import re
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
 from backend.core.user_time import user_today
 from backend.services import ledger as svc
 from backend.services import planning as planning_service
-
 
 
 def _amount(t: dict) -> float:
@@ -66,6 +67,33 @@ def _envelopes(month: dict, txns: list[dict]) -> tuple[list[dict], dict[str, str
     return rows, by_category
 
 
+# The hub's own rules (web/src/data.ts): living spend is these groups; a card's due date and minimum payment
+# are typed into its note ("… hạn trả 26/10/2026 (tối thiểu 153.974đ) …"), "ước tính" marks an estimate.
+LIVING_GROUPS = ("Thiết yếu", "Công việc")
+_DUE = re.compile(r"hạn\s+(?:trả|thanh toán)?\s*(\d{1,2})/(\d{1,2})(?:/(\d{4}))?", re.I)
+_MIN = re.compile(r"tối thiểu\s*(\d{1,3}(?:[.,]\d{3})+|\d+)(?:\s*(?:đ|₫|vnđ|vnd))?(?![^\W_]|[.,]\d)", re.I)
+
+
+def _card_info(note: str, today: date) -> dict:
+    note = unicodedata.normalize("NFC", note or "")
+    due_date = None
+    if m := _DUE.search(note):
+        try:
+            due = date(int(m[3]) if m[3] else today.year, int(m[2]), int(m[1]))
+            # No year written: this year's date, unless that is half a year gone (then it means next year).
+            if not m[3] and due < today - timedelta(days=183):
+                due = due.replace(year=today.year + 1)
+            due_date = due.isoformat()
+        except ValueError:
+            pass
+    mn = _MIN.search(note)
+    return {
+        "dueDate": due_date,
+        "minPayment": int(re.sub(r"[.,]", "", mn[1])) if mn else None,
+        "estimate": "ước tính" in note.lower(),
+    }
+
+
 def build_snapshot() -> dict:
     today = user_today()
     ym = today.strftime("%Y-%m")
@@ -74,37 +102,51 @@ def build_snapshot() -> dict:
     envelopes, envelope_of = _envelopes(month, txns)
 
     accts = svc.accounts.query_accounts()
+    notes = {a["id"]: a.get("note") or "" for a in accts}
     accounts = svc.accounts_with_balances(accts, txns, idx=svc.opening_index(txns, accts))
     acct_rows = [
         {
             "name": a.get("name") or "",
             "type": "Thẻ tín dụng" if a.get("type") == "credit" else a.get("type"),
             "balance": float(a.get("balance_base") if a.get("balance_base") is not None else a.get("balance") or 0),
+            "note": notes.get(a.get("id"), ""),
         }
         for a in accounts
     ]
     cards = sorted(
         (
-            {"name": a["name"], "debt": -a["balance"], "dueDate": None, "minPayment": None, "estimate": False}
+            {"name": a["name"], "debt": -a["balance"], **_card_info(a["note"], today)}
             for a in acct_rows
             if a["type"] == "Thẻ tín dụng"
         ),
-        key=lambda c: -c["debt"],
+        key=lambda c: (c["dueDate"] or "9", -c["debt"]),
     )
+    for a in acct_rows:
+        del a["note"]
+    group_of = {
+        cid: g.get("name")
+        for g in month.get("groups") or []
+        for c in g.get("categories") or []
+        for cid in c.get("category_ids") or []
+    }
 
     in_month = [t for t in txns if str(t.get("date") or "").startswith(ym)]
     income = sum(_amount(t) for t in in_month if t.get("kind") == "income")
     spend = sum(_amount(t) for t in in_month if t.get("kind") == "expense")
-    spenders = [t for t in txns if t.get("kind") in ("expense", "income")]
+    living = sum(
+        _amount(t) for t in in_month if t.get("kind") == "expense" and group_of.get(t.get("category")) in LIVING_GROUPS
+    )
+    kinds = {"expense": "Chi", "income": "Thu", "transfer": "Chuyển nội bộ"}
+    shown = [t for t in txns if t.get("kind") in kinds]
     recent = [
         {
             "date": str(t.get("date") or "")[:10],
             "title": t.get("description") or t.get("memo") or "",
             "amount": _amount(t) * (-1 if t.get("kind") == "expense" else 1),
-            "kind": "Chi" if t.get("kind") == "expense" else "Thu",
+            "kind": kinds[t["kind"]],
             "envelope": envelope_of.get(t.get("category") or ""),
         }
-        for t in sorted(spenders, key=lambda t: str(t.get("date") or ""), reverse=True)[:5]
+        for t in sorted(shown, key=lambda t: str(t.get("date") or ""), reverse=True)[:5]
     ]
     return {
         "month": {
@@ -115,8 +157,8 @@ def build_snapshot() -> dict:
             "spend": spend,
             "net": income - spend,
             "salaryRecorded": income > 0,
-            "spendLiving": spend,
-            "spendDebtTransfer": 0,
+            "spendLiving": living,
+            "spendDebtTransfer": spend - living,
         },
         "envelopes": envelopes,
         "accounts": acct_rows,
