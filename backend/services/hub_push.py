@@ -21,22 +21,35 @@ from backend.services import planning as planning_service
 
 logger = logging.getLogger(__name__)
 
-_STATUS = {"underfunded": "fast", "funded": "ok"}
+
+def _amount(t: dict) -> float:
+    return abs(float(t.get("base_amount") if t.get("base_amount") is not None else t.get("amount") or 0))
 
 
-def _envelopes(month: dict) -> tuple[list[dict], dict[str, str]]:
+def _envelopes(month: dict, txns: list[dict]) -> tuple[list[dict], dict[str, str]]:
+    """The hub's envelope model is one cumulative pot (Notion: Tổng phân bổ − Đã chi = Còn lại), not
+    ChillyBank's monthly rollover, where an overspent month resets to zero and card purchases move
+    money into a card-payment envelope. So spend is summed over the whole ledger per envelope, and
+    card-payment envelopes are left out."""
+    spent_by_category: dict[str, float] = {}
+    for t in txns:
+        if t.get("category") and t.get("kind") in ("expense", "income"):
+            sign = 1 if t["kind"] == "expense" else -1
+            spent_by_category[t["category"]] = spent_by_category.get(t["category"], 0.0) + sign * _amount(t)
     rows, by_category = [], {}
     for group in month.get("groups") or []:
         for c in group.get("categories") or []:
-            available = float(c.get("available") or 0)
-            allocated = float(c.get("assigned_to_date") or c.get("assigned") or 0)
-            # The hub's Đã chi is cumulative, like Tổng phân bổ: what left the envelope since its money arrived.
-            spent = allocated - available if allocated else -float(c.get("activity") or 0)
-            status = "neg" if available < 0 else _STATUS.get(str(c.get("status") or ""))
             for cid in c.get("category_ids") or []:
                 by_category[cid] = c.get("label") or ""
-            if not (allocated or spent or available):
+            if c.get("is_payment_envelope"):
+                continue
+            allocated = float(c.get("assigned_to_date") or 0)
+            spent = sum(spent_by_category.get(cid, 0.0) for cid in c.get("category_ids") or [])
+            remaining = allocated - spent
+            if not (allocated or spent):
                 continue  # an unused envelope (a fresh book's starters) would only clutter the TV list
+            # shortcut: no "fast" (spending ahead of plan); Notion's pace formula is not readable, add it once ChillyBank has a plan horizon.
+            status = "neg" if remaining < 0 else "done" if allocated and remaining == 0 else "ok" if allocated else None
             rows.append(
                 {
                     "id": c.get("envelope_id") or c.get("key"),
@@ -44,7 +57,7 @@ def _envelopes(month: dict) -> tuple[list[dict], dict[str, str]]:
                     "group": group.get("name"),
                     "allocated": allocated,
                     "spent": spent,
-                    "remaining": available,
+                    "remaining": remaining,
                     "usedPct": round(spent / allocated * 100) if allocated else 0,
                     "status": status,
                     "monthsLeft": None,
@@ -59,9 +72,9 @@ def build_snapshot() -> dict:
     today = user_today()
     ym = today.strftime("%Y-%m")
     month = planning_service.budget_month(ym)
-    envelopes, envelope_of = _envelopes(month)
-
     txns = svc.transactions.all()
+    envelopes, envelope_of = _envelopes(month, txns)
+
     accts = svc.accounts.query_accounts()
     accounts = svc.accounts_with_balances(accts, txns, idx=svc.opening_index(txns, accts))
     acct_rows = [
@@ -81,18 +94,15 @@ def build_snapshot() -> dict:
         key=lambda c: -c["debt"],
     )
 
-    def amount(t: dict) -> float:
-        return float(t.get("base_amount") if t.get("base_amount") is not None else t.get("amount") or 0)
-
     in_month = [t for t in txns if str(t.get("date") or "").startswith(ym)]
-    income = sum(abs(amount(t)) for t in in_month if t.get("kind") == "income")
-    spend = sum(abs(amount(t)) for t in in_month if t.get("kind") == "expense")
+    income = sum(_amount(t) for t in in_month if t.get("kind") == "income")
+    spend = sum(_amount(t) for t in in_month if t.get("kind") == "expense")
     spenders = [t for t in txns if t.get("kind") in ("expense", "income")]
     recent = [
         {
             "date": str(t.get("date") or "")[:10],
             "title": t.get("description") or t.get("memo") or "",
-            "amount": abs(amount(t)) * (-1 if t.get("kind") == "expense" else 1),
+            "amount": _amount(t) * (-1 if t.get("kind") == "expense" else 1),
             "kind": "Chi" if t.get("kind") == "expense" else "Thu",
             "envelope": envelope_of.get(t.get("category") or ""),
         }
