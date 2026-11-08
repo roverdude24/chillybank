@@ -34,8 +34,14 @@ Mapping (Notion property -> ChillyBank):
             and is skipped); Ngăn tiền -> category; Tài khoản -> account.
 A row with no Tài khoản, or whose account is gone from the book, goes to one cash account named
 "Notion", opened at zero balance so it adds nothing to net worth on the first sync. Everything is
-in VND. Not imported: the rest of the month table, income-source columns, interest rates, and
-deletions made in Notion.
+in VND. Not imported: the rest of the month table, income-source columns, interest rates.
+
+Deletions: after a complete read, an imported row whose Notion page is gone is deleted here too
+(ledger delete, so it is checkpointed and its identity remembered), unless it was edited here since
+the import; those are kept and counted. If over half the imported rows (or more than 20) vanish at
+once, nothing is deleted. Balances: when an account's Số dư or Cập nhật changes in Notion, the gap
+to the book's balance at Cập nhật is booked as one adjustment "Đối chiếu số dư Notion" (ref
+``bal:<page>:<Cập nhật>``), after the rows are synced so a matching Thu row nets to zero.
 """
 
 from __future__ import annotations
@@ -67,6 +73,7 @@ logger = logging.getLogger(__name__)
 SOURCE = "notion"
 CURRENCY = "VND"
 FALLBACK_REF, FALLBACK_NAME = "fallback", "Notion"
+BALANCE_PREFIX, BALANCE_DESCRIPTION = "bal:", "Đối chiếu số dư Notion"
 DATA_SOURCES = {
     "month": "fb106c98-5875-49a8-b3f9-008ae7e6c895",
     "account": "b431cd69-988c-4a78-81f9-214937e2ed82",
@@ -215,8 +222,15 @@ def _accounts(pages: list[dict], txs: list[dict], fps: dict) -> tuple[dict, dict
     }
     today = user_today().isoformat()
     rows_of = defaultdict(list)  # per account page: the rows still to be booked on it
+    known = {page["id"] for page in pages}
     for tx in txs:
-        if tx["booked"] or tx["ref"] not in fps:  # not one deleted here since the import
+        if not (tx["booked"] or tx["ref"] not in fps):  # one deleted here since the import
+            continue
+        if tx["to_account"]:  # a transfer: out of one account, into the other
+            if tx["account"] in known and tx["to_account"] in known:
+                rows_of[tx["account"]].append((tx["date"], -tx["amount"]))
+                rows_of[tx["to_account"]].append((tx["date"], tx["amount"]))
+        else:
             rows_of[tx["account"]].append((tx["date"], tx["amount"]))
     for page in pages:
         props, ref = _props(page), page["id"]
@@ -418,7 +432,12 @@ def _envelopes(pages: list[dict], envs: dict, fps: dict, start: str | None) -> t
 def _tx(page: dict) -> dict | None:
     props = _props(page)
     day, amount = _day(props.get("Ngày")), _num(props.get("Thu")) - _num(props.get("Chi"))
-    if day is None or amount == 0:
+    source, target = _first(props.get("Tài khoản")), _first(props.get("Đến tài khoản"))
+    # Chuyển nội bộ: Chi and Thu are 0, so the amount is Số tiền; it needs both accounts to be a transfer.
+    transfer = props.get("Loại") == "Chuyển nội bộ" and source and target and source != target
+    if transfer:
+        amount = _num(props.get("Số tiền"))
+    if day is None or (amount <= 0 if transfer else amount == 0):
         return None
     return {
         "ref": page["id"],
@@ -426,7 +445,8 @@ def _tx(page: dict) -> dict | None:
         "amount": amount,
         "description": props.get("Nội dung") or FALLBACK_NAME,
         "memo": props.get("Ghi chú") or "",
-        "account": _first(props.get("Tài khoản")),
+        "account": source,
+        "to_account": target if transfer else None,
         "envelope": _first(props.get("Ngăn tiền")),
         "source": props.get("Nguồn thu"),
         "funding": props.get("Nguồn tiền"),
@@ -438,25 +458,39 @@ def _income_category(tx: dict) -> str:
     "Lãi …" is interest (the TV hub reads it the same way); anything else untagged is other income."""
     source = tx.get("source")
     if not source or source == "Khác":
-        source = "Lãi tiền gửi" if _nfc(tx["description"]).lower().startswith("lãi") else "Thu nhập khác"
-    return categories_service.resolve_category_ref(source) or categories_service.create_category(source, "income")["id"]
+        source = (
+            "Lãi tiền gửi" if _nfc(tx["description"]).lower().startswith("lãi") else "Thu nhập khác"
+        )
+    return (
+        categories_service.resolve_category_ref(source)
+        or categories_service.create_category(source, "income")["id"]
+    )
 
 
-def _booking(tx: dict, account: str | None, categories: dict) -> dict:
+def _booking(
+    tx: dict, account: str | None, categories: dict, to_account: str | None = None
+) -> dict:
     """The ledger fields a Notion row means. The unused leg is cleared, so a row whose Chi became a Thu
     flips cleanly. A row's category is left as it is when its envelope no longer exists here."""
-    side, other = ("to", "from") if tx["amount"] > 0 else ("from", "to")
+    if tx["to_account"]:  # a transfer has both legs
+        side, other = "from", "to"
+        legs = {
+            "to_account_id": to_account,
+            "to_amount": tx["amount"],
+            "to_currency": CURRENCY,
+        }
+    else:
+        side, other = ("to", "from") if tx["amount"] > 0 else ("from", "to")
+        legs = {f"{other}_account_id": None, f"{other}_amount": None, f"{other}_currency": None}
     row = {
         "date": tx["date"],
-        "kind": "income" if tx["amount"] > 0 else "expense",
+        "kind": "transfer" if tx["to_account"] else "income" if tx["amount"] > 0 else "expense",
         "description": tx["description"],
         "memo": tx["memo"],
         f"{side}_account_id": account,
         f"{side}_amount": abs(tx["amount"]),
         f"{side}_currency": CURRENCY,
-        f"{other}_account_id": None,
-        f"{other}_amount": None,
-        f"{other}_currency": None,
+        **legs,
     }
     if not tx["envelope"] or tx["envelope"] in categories:
         row["category"] = categories.get(tx["envelope"])
@@ -472,7 +506,14 @@ def _transactions(txs: list[dict], accounts: dict, categories: dict, fps: dict) 
     account_rows = ledger_service.accounts.all()
     for tx in txs:
         ref = tx["ref"]
-        data = _booking(tx, accounts.get(tx["account"], accounts.get(FALLBACK_REF)), categories)
+        if tx["to_account"]:
+            source, target = accounts.get(tx["account"]), accounts.get(tx["to_account"])
+            if source is None or target is None:  # an account that was not imported
+                counts["skipped"] += 1
+                continue
+        else:
+            source, target = accounts.get(tx["account"], accounts.get(FALLBACK_REF)), None
+        data = _booking(tx, source, categories, target)
         existing = tx["booked"]
         try:
             if existing is not None:
@@ -513,11 +554,170 @@ def _transactions(txs: list[dict], accounts: dict, categories: dict, fps: dict) 
     return counts
 
 
+_BOOKING_KEYS = (
+    "date",
+    "kind",
+    "description",
+    "memo",
+    "from_account_id",
+    "from_amount",
+    "from_currency",
+    "to_account_id",
+    "to_amount",
+    "to_currency",
+)
+MAX_VANISHED = 20  # more rows than this gone from Notion in one sync is a bad read, not a clean-up
+
+
+def _unchanged_since_import(row: dict, stored: str) -> bool:
+    """Does the row still read exactly as the sync booked it? ``category`` and ``tags`` were part of
+    the booking only sometimes (no envelope here, no Nguồn tiền), so each way of leaving them out
+    is tried; a row someone gave tags to is never taken for untagged."""
+    base = {key: row.get(key) for key in _BOOKING_KEYS}
+    for with_category in (True, False):
+        for with_tags in (True, False):
+            if not with_tags and row.get("tags"):
+                continue
+            booking = dict(base)
+            if with_category:
+                booking["category"] = row.get("category")
+            if with_tags:
+                booking["tags"] = row.get("tags")
+            if _fp(booking) == stored:
+                return True
+    return False
+
+
+def _vanished(page_ids: set[str], fps: dict) -> dict:
+    """Mirror rows deleted in Notion. Called after a complete read of the transaction source, so a
+    row whose page is no longer in it was deleted there. It is deleted here too, through the ledger's
+    own delete, unless someone edited it here since the import (it is kept and counted). Nothing is
+    deleted when an implausible share of the imported rows has vanished at once."""
+    out = {"deleted": 0, "kept_edited": 0}
+    gone, imported = [], 0
+    for row in ledger_service.transactions.all():
+        if row.get("deleted"):
+            continue
+        ref = next(
+            (
+                e["ref"]
+                for e in row.get("external_refs") or []
+                if e.get("source") == SOURCE and not e["ref"].startswith(BALANCE_PREFIX)
+            ),
+            None,
+        )
+        if ref is None:
+            continue
+        imported += 1
+        if ref not in page_ids:
+            gone.append((ref, row))
+    if not gone:
+        return out
+    if len(gone) > MAX_VANISHED or len(gone) * 2 > imported:
+        logger.warning(
+            "notion_input: %d of %d imported rows are gone from Notion; deleting none",
+            len(gone),
+            imported,
+        )
+        out["delete_blocked"] = len(gone)
+        return out
+    doomed = []
+    for ref, row in gone:
+        if fps.get(ref) and _unchanged_since_import(row, fps[ref]):
+            doomed.append((ref, row["id"]))
+        else:
+            out["kept_edited"] += 1
+    if doomed:
+        ledger_service.bulk_delete_transactions([txn_id for _, txn_id in doomed])
+        for ref, _ in doomed:
+            fps.pop(ref, None)
+        out["deleted"] = len(doomed)
+    return out
+
+
+def _adjustment_legs(account: dict, delta: float) -> dict:
+    side, other = ("to", "from") if delta > 0 else ("from", "to")
+    return {
+        f"{side}_account_id": account["id"],
+        f"{side}_amount": abs(delta),
+        f"{side}_currency": account.get("currency") or CURRENCY,
+        f"{other}_account_id": None,
+        f"{other}_amount": None,
+        f"{other}_currency": None,
+    }
+
+
+def _reconcile_one(account: dict, page_ref: str, balance: float, day: str) -> bool:
+    """Make the account read ``balance`` on ``day`` with one adjustment, the row ``ledger.reconcile``
+    books (an ``adjustment`` through ``create_transaction``). ``reconcile`` itself diffs the cleared
+    balance as of today under a fixed description, so it cannot be dated, referenced or idempotent."""
+    txns = ledger_service.transactions.all()
+    opened = ledger_service.opening_date(account, txns)
+    day = max(day, opened or day)  # before its tracking start the book holds nothing to compare
+    current = ledger_service.account_balance_as_of(account, day, txns, opened)
+    delta = round(balance - current, 2)
+    if abs(delta) < 1:
+        return False
+    ref = f"{BALANCE_PREFIX}{page_ref}:{day}"
+    existing = ledger_service.transactions.by_external_ref(SOURCE, ref)
+    if existing is not None:  # Số dư corrected again on the same Cập nhật: move that adjustment
+        signed = (existing.get("to_amount") or 0.0) - (existing.get("from_amount") or 0.0)
+        total = round(signed + delta, 2)
+        if total == 0:
+            ledger_service.bulk_delete_transactions([existing["id"]], reject_identities=False)
+        else:
+            ledger_service.update_transaction(
+                existing["id"], _adjustment_legs(account, total), labels_as_given=True
+            )
+        return True
+    ledger_service.create_transaction(
+        {
+            "date": day,
+            "kind": "adjustment",
+            "description": BALANCE_DESCRIPTION,
+            "source": "feed",
+            "cleared": True,
+            "needs_review": False,
+            "external_refs": [{"source": SOURCE, "ref": ref}],
+            **_adjustment_legs(account, delta),
+        },
+        allow_duplicate=True,
+        labels_as_given=True,
+    )
+    return True
+
+
+def _reconcile(pages: list[dict], ids: dict, seen: dict) -> int:
+    """Keep each account at Notion's Số dư. The family types a new Số dư (and Cập nhật) by hand, and
+    rows without a single account (Chuyển nội bộ) never reach the book, so balances drift. When the
+    pair changes, the difference at Cập nhật is booked once. The first sight of an account only
+    records the pair; its opening already agrees with it."""
+    today, reconciled = user_today().isoformat(), 0
+    for page in pages:
+        props, ref = _props(page), page["id"]
+        account = ledger_service.accounts.find_by_id(ids[ref]) if ref in ids else None
+        if account is None:
+            continue
+        pair = [_num(props.get("Số dư")), _day(props.get("Cập nhật"))]
+        if ref not in seen:
+            seen[ref] = pair
+        elif seen[ref] != pair:
+            balance = -abs(pair[0]) if account.get("type") == "loan" else pair[0]
+            try:
+                reconciled += _reconcile_one(account, ref, balance, pair[1] or today)
+            except (OpenNetWorthError, ValueError) as exc:
+                logger.warning("notion_input: %r not reconciled: %s", account.get("name"), exc)
+                continue
+            seen[ref] = pair
+    return reconciled
+
+
 def _apply(pages: dict[str, list[dict]]) -> dict:
     owns_scope = set_audit_scope_if_absent("system", "import:notion", note="Notion Tài chính")
     doc = _links.get() or {}
     before = copy.deepcopy(doc)
     fps, envs = doc.setdefault("fp", {}), doc.setdefault("env", {})
+    balances = doc.setdefault("bal", {})
     try:
         txs = [tx for tx in map(_tx, pages["tx"]) if tx]
         for tx in txs:
@@ -527,6 +727,8 @@ def _apply(pages: dict[str, list[dict]]) -> dict:
         envelopes, category_ids = _envelopes(pages["envelope"], envs, fps, start)
         transactions = _transactions(txs, account_ids, category_ids, fps)
         transactions["skipped"] += len(pages["tx"]) - len(txs)
+        transactions |= _vanished({p["id"] for p in pages["tx"]}, fps)
+        accounts["reconciled"] = _reconcile(pages["account"], account_ids, balances)
     finally:
         if doc != before:
             _links.save(doc)

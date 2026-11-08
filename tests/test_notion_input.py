@@ -90,16 +90,19 @@ def month(page_id, label, start):
     return page(page_id, {"Tháng": title(label), "Kỳ": when(start)})
 
 
-def row(page_id, name, day, *, chi=0, thu=0, bank=None, env=None, note=""):
+def row(page_id, name, day, *, chi=0, thu=0, bank=None, env=None, note="", to=None, moved=0):
+    """A Notion row. A transfer (``moved``) has Chi and Thu of 0 and its amount in Số tiền."""
     return page(
         page_id,
         {
             "Nội dung": title(name),
             "Ngày": when(day),
+            "Số tiền": number(chi or thu or moved or None),
             "Chi": formula(chi),
             "Thu": formula(thu),
             "Loại": select("Chi" if chi else "Thu" if thu else "Chuyển nội bộ"),
             "Tài khoản": relation(*filter(None, [bank])),
+            "Đến tài khoản": relation(*filter(None, [to])),
             "Ngăn tiền": relation(*filter(None, [env])),
             "Ghi chú": text(note),
         },
@@ -212,12 +215,15 @@ async def test_first_sync_books_accounts_envelopes_and_rows(notion: FakeNotion) 
             "created": 4,
             "updated": 0,
             "skipped": 0,
+            "reconciled": 0,
         },  # three typed + the "Notion" catch-all
         "envelopes": {"created": 2, "updated": 0, "skipped": 0},
         "transactions": {
             "created": 4,
             "updated": 0,
             "skipped": 1,
+            "deleted": 0,
+            "kept_edited": 0,
         },  # the Chuyển nội bộ row has no direction
     }
 
@@ -283,9 +289,15 @@ async def test_first_sync_books_accounts_envelopes_and_rows(notion: FakeNotion) 
     )
 
 
-async def test_income_is_categorized_by_its_source_and_funding_becomes_a_tag(notion: FakeNotion) -> None:
-    interest = row("tx-interest", "Lãi MoMo Túi Thần Tài", "2026-11-06", thu=90_451, bank="page-bank")
-    sale = row("tx-sale", "Bên mua căn hộ trả phần còn lại", "2026-11-07", thu=10_000_000, bank="page-bank")
+async def test_income_is_categorized_by_its_source_and_funding_becomes_a_tag(
+    notion: FakeNotion,
+) -> None:
+    interest = row(
+        "tx-interest", "Lãi MoMo Túi Thần Tài", "2026-11-06", thu=90_451, bank="page-bank"
+    )
+    sale = row(
+        "tx-sale", "Bên mua căn hộ trả phần còn lại", "2026-11-07", thu=10_000_000, bank="page-bank"
+    )
     sale["properties"]["Nguồn thu"] = select("Project Vinh")
     sale["properties"]["Nguồn tiền"] = select("Tiền bán nhà (của mẹ)")
     notion.data[TX] += [interest, sale]
@@ -293,7 +305,9 @@ async def test_income_is_categorized_by_its_source_and_funding_becomes_a_tag(not
     await notion_input.sync_notion_input()
 
     rows = imported()
-    assert rows["Lãi MoMo Túi Thần Tài"]["category"] == categories_service.resolve_category_ref("Lãi tiền gửi")
+    assert rows["Lãi MoMo Túi Thần Tài"]["category"] == categories_service.resolve_category_ref(
+        "Lãi tiền gửi"
+    )
     booked = rows["Bên mua căn hộ trả phần còn lại"]
     assert booked["category"] == categories_service.resolve_category_ref("Project Vinh")
     assert booked["tags"] == ["Nguồn: Tiền bán nhà (của mẹ)"]
@@ -311,9 +325,9 @@ async def test_second_sync_changes_nothing(notion: FakeNotion) -> None:
     again = await notion_input.sync_notion_input()
 
     assert again == {
-        "accounts": {"created": 0, "updated": 0, "skipped": 3},
+        "accounts": {"created": 0, "updated": 0, "skipped": 3, "reconciled": 0},
         "envelopes": {"created": 0, "updated": 0, "skipped": 2},
-        "transactions": {"created": 0, "updated": 0, "skipped": 5},
+        "transactions": {"created": 0, "updated": 0, "skipped": 5, "deleted": 0, "kept_edited": 0},
     }
     assert (
         ledger_service.accounts.all(),
@@ -360,7 +374,13 @@ async def test_an_edited_row_updates_in_place(notion: FakeNotion) -> None:
     )
     result = await notion_input.sync_notion_input()
 
-    assert result["transactions"] == {"created": 0, "updated": 1, "skipped": 4}
+    assert result["transactions"] == {
+        "created": 0,
+        "updated": 1,
+        "skipped": 4,
+        "deleted": 0,
+        "kept_edited": 0,
+    }
     edited = imported()["Cơm trưa + nước"]
     assert edited["id"] == lunch["id"]
     assert (edited["from_amount"], edited["memo"]) == (65_000, "văn phòng")
@@ -449,7 +469,13 @@ async def test_a_deleted_row_stays_deleted(notion: FakeNotion) -> None:
 
     result = await notion_input.sync_notion_input()
 
-    assert result["transactions"] == {"created": 0, "updated": 0, "skipped": 5}
+    assert result["transactions"] == {
+        "created": 0,
+        "updated": 0,
+        "skipped": 5,
+        "deleted": 0,
+        "kept_edited": 0,
+    }
     assert "Quà" not in imported()
 
 
@@ -514,8 +540,14 @@ async def test_a_deleted_account_stays_deleted_with_its_rows(notion: FakeNotion,
     caplog.clear()
     result = await notion_input.sync_notion_input()
 
-    assert result["accounts"] == {"created": 0, "updated": 0, "skipped": 3}
-    assert result["transactions"] == {"created": 0, "updated": 0, "skipped": 3}
+    assert result["accounts"] == {"created": 0, "updated": 0, "skipped": 3, "reconciled": 0}
+    assert result["transactions"] == {
+        "created": 0,
+        "updated": 0,
+        "skipped": 3,
+        "deleted": 0,
+        "kept_edited": 0,
+    }
     # Its rows are still in Notion, but they are not a reason to open the "Notion" catch-all.
     assert set(accounts_by_name()) == {"Thẻ Visa", "Sổ tiết kiệm"}
     assert set(imported()) == {"Cà phê"}
@@ -562,23 +594,6 @@ async def test_an_envelope_renamed_and_regrouped_in_notion_follows(notion: FakeN
         None,
     ]  # only the envelope was renamed
     assert imported()["Cơm trưa"]["category"] == food["category_ids"][0]
-
-
-async def test_the_opening_balance_is_taken_once(notion: FakeNotion) -> None:
-    await notion_input.sync_notion_input()
-
-    edit(
-        notion,
-        ACCOUNT,
-        "page-save",
-        **{"Số dư": number(120_000_000), "Ghi chú": text("kỳ hạn 6 tháng")},
-    )
-    result = await notion_input.sync_notion_input()
-
-    assert result["accounts"]["updated"] == 1  # the note follows; the balance does not
-    saving = accounts_by_name()["Sổ tiết kiệm"]
-    assert saving["note"] == "kỳ hạn 6 tháng"
-    assert ledger_service.balances()[saving["id"]] == 100_000_000
 
 
 async def test_nothing_is_written_when_notion_cannot_be_read(notion: FakeNotion) -> None:
@@ -749,3 +764,321 @@ async def test_envelopes_imported_before_allocations_existed_pick_them_up(
 
     assert result["envelopes"] == {"created": 0, "updated": 2, "skipped": 0}
     assert budget_row("Dự phòng", "2026-10")["assigned"] == 5_000_000
+
+
+def adjustments() -> list[dict]:
+    return sorted(
+        (
+            t
+            for t in ledger_service.transactions.all()
+            if t.get("description") == notion_input.BALANCE_DESCRIPTION and not t.get("deleted")
+        ),
+        key=lambda t: t["date"],
+    )
+
+
+def balance_of(name: str) -> float:
+    return ledger_service.balances()[accounts_by_name()[name]["id"]]
+
+
+# ── Chuyển nội bộ ──
+
+
+def tracked_from_november(fake: FakeNotion) -> None:
+    """Sổ tiết kiệm has no Cập nhật; give it one so a November transfer lands inside its history."""
+    edit(fake, ACCOUNT, "page-save", **{"Cập nhật": when("2026-11-01")})
+
+
+async def test_a_transfer_row_moves_money_between_the_two_accounts(notion: FakeNotion) -> None:
+    tracked_from_november(notion)
+    await notion_input.sync_notion_input()
+    notion.data[TX].append(
+        row("tx-xfer", "Rút tiền", "2026-11-08", moved=1_000_000, bank="page-bank", to="page-save")
+    )
+
+    result = await notion_input.sync_notion_input()
+
+    assert result["transactions"]["created"] == 1
+    moved = imported()["Rút tiền"]
+    accounts = accounts_by_name()
+    assert (moved["kind"], moved["from_amount"], moved["to_amount"]) == (
+        "transfer",
+        1_000_000,
+        1_000_000,
+    )
+    assert (moved["from_account_id"], moved["to_account_id"]) == (
+        accounts["Ngân hàng"]["id"],
+        accounts["Sổ tiết kiệm"]["id"],
+    )
+    assert (balance_of("Ngân hàng"), balance_of("Sổ tiết kiệm")) == (9_000_000, 101_000_000)
+    assert moved["external_refs"] == [{"source": "notion", "ref": "tx-xfer"}]
+
+
+async def test_a_transfer_without_a_destination_is_skipped(notion: FakeNotion) -> None:
+    notion.data[TX].append(
+        row("tx-half", "Chuyển dở", "2026-11-09", moved=1_000_000, bank="page-bank")
+    )
+
+    result = await notion_input.sync_notion_input()
+
+    assert result["transactions"]["skipped"] == 2  # the old Chuyển quỹ row and this one
+    assert "Chuyển dở" not in imported()
+    assert balance_of("Ngân hàng") == 10_000_000
+
+
+async def test_a_transfer_is_edited_and_deleted_like_any_row(notion: FakeNotion) -> None:
+    tracked_from_november(notion)
+    notion.data[TX].append(
+        row("tx-xfer", "Rút tiền", "2026-11-08", moved=1_000_000, bank="page-bank", to="page-save")
+    )
+    await notion_input.sync_notion_input()
+    moved = imported()["Rút tiền"]
+
+    edit(notion, TX, "tx-xfer", **{"Số tiền": number(2_000_000)})
+    result = await notion_input.sync_notion_input()
+    assert result["transactions"]["updated"] == 1
+    assert imported()["Rút tiền"]["id"] == moved["id"]
+    assert imported()["Rút tiền"]["to_amount"] == 2_000_000
+
+    notion.data[TX] = [t for t in notion.data[TX] if t["id"] != "tx-xfer"]
+    result = await notion_input.sync_notion_input()
+    assert result["transactions"]["deleted"] == 1
+    assert "Rút tiền" not in imported()
+
+
+# ── Deletions in Notion ──
+
+
+async def test_a_row_deleted_in_notion_is_deleted_here(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+
+    notion.data[TX] = [t for t in notion.data[TX] if t["id"] != "tx-lunch"]
+    result = await notion_input.sync_notion_input()
+
+    assert result["transactions"]["deleted"] == 1
+    assert "Cơm trưa" not in imported()
+    assert set(imported()) == {"Lương", "Cà phê", "Quà"}
+    again = await notion_input.sync_notion_input()  # and it is not a count that keeps coming back
+    assert (again["transactions"]["deleted"], again["transactions"]["kept_edited"]) == (0, 0)
+
+
+async def test_a_row_edited_here_survives_its_deletion_in_notion(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    lunch = imported()["Cơm trưa"]
+    ledger_service.update_transaction(lunch["id"], {"memo": "đã đối chiếu"}, labels_as_given=True)
+
+    notion.data[TX] = [t for t in notion.data[TX] if t["id"] != "tx-lunch"]
+    result = await notion_input.sync_notion_input()
+
+    assert (result["transactions"]["deleted"], result["transactions"]["kept_edited"]) == (0, 1)
+    assert imported()["Cơm trưa"]["id"] == lunch["id"]
+
+
+async def test_nothing_is_deleted_when_most_rows_vanish_at_once(notion: FakeNotion, caplog) -> None:
+    await notion_input.sync_notion_input()
+
+    notion.data[TX] = [t for t in notion.data[TX] if t["id"] in ("tx-gift", "tx-move")]
+    caplog.clear()
+    result = await notion_input.sync_notion_input()
+
+    assert result["transactions"]["deleted"] == 0
+    assert result["transactions"]["delete_blocked"] == 3
+    assert set(imported()) == {"Cơm trưa", "Lương", "Cà phê", "Quà"}
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+async def test_a_deleted_row_does_not_count_against_the_guard_twice(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    notion.data[TX] = [t for t in notion.data[TX] if t["id"] != "tx-lunch"]
+    await notion_input.sync_notion_input()
+
+    notion.data[TX] = [t for t in notion.data[TX] if t["id"] != "tx-coffee"]
+    result = await notion_input.sync_notion_input()
+
+    assert result["transactions"]["deleted"] == 1
+    assert set(imported()) == {"Lương", "Quà"}
+
+
+# ── Số dư ──
+
+
+async def test_first_sight_of_an_account_only_records_its_so_du(notion: FakeNotion) -> None:
+    first = await notion_input.sync_notion_input()
+    assert first["accounts"]["reconciled"] == 0 and adjustments() == []
+
+    state = NamespacedSettingsStore("notion_input")
+    doc = state.get()
+    doc.pop("bal")  # a book synced before balances were followed
+    state.save(doc)
+    edit(
+        notion,
+        ACCOUNT,
+        "page-bank",
+        **{"Số dư": number(10_500_000), "Cập nhật": when("2026-11-12")},
+    )
+    second = await notion_input.sync_notion_input()
+
+    assert second["accounts"]["reconciled"] == 0 and adjustments() == []
+    assert balance_of("Ngân hàng") == 10_000_000
+
+
+async def test_a_raised_so_du_with_no_row_is_booked_once_at_cap_nhat(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+
+    edit(
+        notion,
+        ACCOUNT,
+        "page-bank",
+        **{"Số dư": number(10_500_000), "Cập nhật": when("2026-11-12")},
+    )
+    result = await notion_input.sync_notion_input()
+
+    assert result["accounts"]["reconciled"] == 1
+    (adjust,) = adjustments()
+    assert (adjust["kind"], adjust["date"], adjust["to_amount"]) == (
+        "adjustment",
+        "2026-11-12",
+        500_000,
+    )
+    assert adjust["to_account_id"] == accounts_by_name()["Ngân hàng"]["id"]
+    assert adjust["external_refs"] == [{"source": "notion", "ref": "bal:page-bank:2026-11-12"}]
+    assert balance_of("Ngân hàng") == 10_500_000
+
+    again = await notion_input.sync_notion_input()
+    assert again["accounts"]["reconciled"] == 0
+    assert len(adjustments()) == 1
+
+
+async def test_a_lowered_so_du_books_money_out(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+
+    edit(
+        notion, ACCOUNT, "page-bank", **{"Số dư": number(9_000_000), "Cập nhật": when("2026-11-12")}
+    )
+    await notion_input.sync_notion_input()
+
+    (adjust,) = adjustments()
+    assert (adjust["from_amount"], adjust["to_amount"]) == (1_000_000, None)
+    assert balance_of("Ngân hàng") == 9_000_000
+
+
+async def test_a_raised_so_du_with_its_matching_row_books_no_adjustment(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+
+    notion.data[TX].append(row("tx-bonus", "Thưởng", "2026-11-11", thu=500_000, bank="page-bank"))
+    edit(
+        notion,
+        ACCOUNT,
+        "page-bank",
+        **{"Số dư": number(10_500_000), "Cập nhật": when("2026-11-12")},
+    )
+    result = await notion_input.sync_notion_input()
+
+    assert result["accounts"]["reconciled"] == 0 and adjustments() == []
+    assert balance_of("Ngân hàng") == 10_500_000
+
+
+async def test_a_so_du_with_its_matching_transfer_books_no_adjustment(notion: FakeNotion) -> None:
+    tracked_from_november(notion)
+    await notion_input.sync_notion_input()
+
+    notion.data[TX].append(
+        row("tx-xfer", "Rút tiền", "2026-11-09", moved=1_000_000, bank="page-bank", to="page-save")
+    )
+    edit(
+        notion, ACCOUNT, "page-bank", **{"Số dư": number(9_000_000), "Cập nhật": when("2026-11-12")}
+    )
+    edit(
+        notion,
+        ACCOUNT,
+        "page-save",
+        **{"Số dư": number(101_000_000), "Cập nhật": when("2026-11-12")},
+    )
+    result = await notion_input.sync_notion_input()
+
+    assert result["accounts"]["reconciled"] == 0 and adjustments() == []
+    assert (balance_of("Ngân hàng"), balance_of("Sổ tiết kiệm")) == (9_000_000, 101_000_000)
+
+
+async def test_a_later_cap_nhat_books_a_new_adjustment(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    edit(
+        notion,
+        ACCOUNT,
+        "page-bank",
+        **{"Số dư": number(10_500_000), "Cập nhật": when("2026-11-12")},
+    )
+    await notion_input.sync_notion_input()
+
+    edit(
+        notion,
+        ACCOUNT,
+        "page-bank",
+        **{"Số dư": number(11_000_000), "Cập nhật": when("2026-11-15")},
+    )
+    await notion_input.sync_notion_input()
+
+    assert [(a["date"], a["to_amount"]) for a in adjustments()] == [
+        ("2026-11-12", 500_000),
+        ("2026-11-15", 500_000),
+    ]
+    assert balance_of("Ngân hàng") == 11_000_000
+
+
+async def test_correcting_so_du_on_the_same_cap_nhat_moves_that_adjustment(
+    notion: FakeNotion,
+) -> None:
+    await notion_input.sync_notion_input()
+    edit(
+        notion,
+        ACCOUNT,
+        "page-bank",
+        **{"Số dư": number(10_500_000), "Cập nhật": when("2026-11-12")},
+    )
+    await notion_input.sync_notion_input()
+
+    edit(notion, ACCOUNT, "page-bank", **{"Số dư": number(10_700_000)})
+    await notion_input.sync_notion_input()
+
+    (adjust,) = adjustments()
+    assert adjust["to_amount"] == 700_000
+    assert balance_of("Ngân hàng") == 10_700_000
+
+    edit(notion, ACCOUNT, "page-bank", **{"Số dư": number(10_000_000)})  # back to what the rows say
+    await notion_input.sync_notion_input()
+    assert adjustments() == [] and balance_of("Ngân hàng") == 10_000_000
+
+
+async def test_a_loan_is_reconciled_as_a_debt(notion: FakeNotion) -> None:
+    notion.data[ACCOUNT].append(
+        account(
+            "page-loan", "Vay xe", "Thanh toán", 5_000_000, "2026-11-01", thanh_khoan="Nợ phải trả"
+        )
+    )
+    await notion_input.sync_notion_input()
+    assert balance_of("Vay xe") == -5_000_000
+
+    edit(
+        notion, ACCOUNT, "page-loan", **{"Số dư": number(4_000_000), "Cập nhật": when("2026-11-12")}
+    )
+    await notion_input.sync_notion_input()
+
+    assert balance_of("Vay xe") == -4_000_000
+
+
+async def test_a_cap_nhat_before_the_tracking_start_books_at_the_start(notion: FakeNotion) -> None:
+    await (
+        notion_input.sync_notion_input()
+    )  # Sổ tiết kiệm has no Cập nhật: tracked from today, 20/11
+
+    edit(
+        notion,
+        ACCOUNT,
+        "page-save",
+        **{"Số dư": number(101_000_000), "Cập nhật": when("2026-11-12")},
+    )
+    await notion_input.sync_notion_input()
+
+    (adjust,) = adjustments()
+    assert (adjust["date"], adjust["to_amount"]) == ("2026-11-20", 1_000_000)
+    assert balance_of("Sổ tiết kiệm") == 101_000_000

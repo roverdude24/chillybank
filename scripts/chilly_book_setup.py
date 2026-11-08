@@ -8,19 +8,31 @@ Re-runnable: every step checks before it writes.
 2. Creates the income categories Notion tags rows with (Nguồn thu).
 3. Adds payees with rules that route Vietnamese merchants, bills and transfers to Notion's
    envelopes, so statements, Telegram and email land in the right envelope with no review.
-4. Runs the Notion sync, which re-books Notion income under those categories.
+4. Gives Lucius read access to Notion (HOMETV bot key) plus "create a row", and his
+   `ghi-giao-dich` skill for logging money into Notion Giao dịch.
+5. Runs the Notion sync, which re-books Notion income under those categories.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+from pathlib import Path
 
 from backend.core.errors import ConflictError
 from backend.services import categories as categories_service
 from backend.services import envelopes as envelopes_service
 from backend.services import payee_registry, planning
 from backend.services.notion_input import sync_notion_input
+
+NOTION_READ_TOOLS = [
+    "API-get-self", "API-post-search", "API-get-block-children", "API-retrieve-a-block",
+    "API-retrieve-a-page", "API-retrieve-a-page-property", "API-retrieve-a-comment",
+    "API-query-data-source", "API-retrieve-a-data-source", "API-retrieve-a-database",
+    "API-list-data-source-templates", "API-retrieve-page-markdown",
+]
+SKILL = Path(__file__).with_name("chilly_skills") / "ghi-giao-dich.md"
 
 STARTER_GROUPS = ("Bills", "Needs", "Wants")
 INCOME = ("Lãi tiền gửi", "Lương Ánh", "Project Vinh", "Zenme 1%", "Thu nhập khác")
@@ -104,8 +116,50 @@ def payees() -> list[str]:
     return done
 
 
+def notion_mcp() -> str:
+    """Lucius's Notion tools: reads, plus creating rows (a connector tool asks before every call)."""
+    from backend.db.mcp_client_store import McpClientStore
+    from backend.models.mcp_client import McpServerConfig
+
+    token = os.getenv("NOTION_TOKEN")
+    if not token:
+        return "skip: no NOTION_TOKEN"
+    store = McpClientStore()
+    fields = {
+        "name": "Notion (Tài chính)",
+        "transport": "stdio",
+        "command": "/opt/homebrew/bin/npx",
+        "args": ["-y", "@notionhq/notion-mcp-server"],
+        "env": {"NOTION_TOKEN": token, "PATH": "/opt/homebrew/bin:/usr/bin:/bin"},
+        "enabled": True,
+        "read_only": False,
+        "tool_allowlist": [*NOTION_READ_TOOLS, "API-post-page"],
+    }
+    if store.find("notion"):
+        store.update("notion", fields)
+        return "updated"
+    store.create(McpServerConfig(id="notion", **fields))
+    return "created"
+
+
+def lucius_skill() -> str:
+    from backend.ai.tools.registry import dispatch
+    from backend.db.skill_store import SkillStore
+
+    body = SKILL.read_text(encoding="utf-8")
+    description = "Ghi khoản chi/thu/chuyển tiền của gia đình vào Notion Giao dịch (sổ chính), ChillyBank tự đồng bộ."
+    if any(s.get("id") == "ghi-giao-dich" for s in SkillStore().all()):
+        call = ("update_skill", {"skill_id": "ghi-giao-dich", "changes": {"body": body, "description": description}})
+    else:
+        call = ("create_skill", {"name": "ghi-giao-dich", "description": description, "body": body})
+    text, _ = asyncio.run(dispatch(*call))
+    return json.loads(text).get("ok") and call[0]
+
+
 def main() -> None:
     report = {"tidied": tidy_starters(), "income": [category(c, "income") and c for c in INCOME], "payees": payees()}
+    report["notion_mcp"] = notion_mcp()
+    report["skill"] = lucius_skill()
     report["notion"] = asyncio.run(sync_notion_input())
     print(json.dumps(report, ensure_ascii=False, indent=1))
 

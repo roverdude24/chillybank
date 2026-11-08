@@ -685,6 +685,7 @@ def start() -> None:
     logger.info("scheduler: daily_backup scheduled — daily at 03:30 local")
 
     # ChillyBank: HNX/UPCoM stocks and domestic gold (services/vn_prices.py), every 15 minutes.
+    from backend.services.chilly_jobs import guarded
     from backend.services.hub_push import push_to_hub
     from backend.services.notion_input import sync_notion_input
     from backend.services.vn_prices import refresh_vn_prices
@@ -698,7 +699,7 @@ def start() -> None:
     )
     # ChillyBank: the family TV's Tài chính snapshot (services/hub_push.py); no-op until configured.
     _scheduler.add_job(
-        push_to_hub,
+        guarded("Gửi số liệu lên TV", push_to_hub),
         trigger=IntervalTrigger(minutes=5),
         id="hub_push",
         replace_existing=True,
@@ -706,7 +707,7 @@ def start() -> None:
     )
     # ChillyBank: Notion Tài chính is an input channel (services/notion_input.py); no-op without NOTION_TOKEN.
     _scheduler.add_job(
-        sync_notion_input,
+        guarded("Đồng bộ Notion", sync_notion_input),
         trigger=IntervalTrigger(minutes=10),
         id="notion_input",
         replace_existing=True,

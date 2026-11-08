@@ -9,7 +9,6 @@ Off unless ``CHILLY_HUB_URL`` and ``CHILLY_HUB_PUSH_KEY`` are both set.
 
 from __future__ import annotations
 
-import logging
 import os
 from datetime import datetime, timezone
 
@@ -19,7 +18,6 @@ from backend.core.user_time import user_today
 from backend.services import ledger as svc
 from backend.services import planning as planning_service
 
-logger = logging.getLogger(__name__)
 
 
 def _amount(t: dict) -> float:
@@ -135,19 +133,17 @@ def build_snapshot() -> dict:
 
 
 async def push_to_hub() -> bool:
+    """Send the snapshot; False when not configured. A failed push raises (chilly_jobs reports it);
+    the TV keeps showing the last snapshot meanwhile."""
     url, key = os.getenv("CHILLY_HUB_URL"), os.getenv("CHILLY_HUB_PUSH_KEY")
     if not url or not key:
         return False
-    try:
-        snapshot = build_snapshot()
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(
-                url.rstrip("/") + "/api/finance/snapshot",
-                json=snapshot,
-                headers={"Authorization": f"Bearer {key}"},
-            )
-        r.raise_for_status()
-        return True
-    except Exception as exc:  # noqa: BLE001 — a missed push leaves the TV on the last snapshot
-        logger.warning("hub_push: failed: %s", exc)
-        return False
+    snapshot = build_snapshot()
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            url.rstrip("/") + "/api/finance/snapshot",
+            json=snapshot,
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    r.raise_for_status()
+    return True

@@ -63,6 +63,19 @@ Leave the two `CHILLY_HUB_*` lines out until the book holds the family's real da
 - 31 payee rules route Vietnamese merchants, bills, AI tools, school fees, card payments and interest from statements, Telegram and email to those envelopes.
 - Rebuild or re-apply: `set -a; . ./.env; set +a; .venv/bin/python scripts/chilly_book_setup.py` (safe to re-run).
 
+### Family scenarios
+
+| Scenario | What happens |
+|---|---|
+| Spend or income | One row in Notion Giao dịch, or tell Lucius in chat ("ăn trưa 85k MoMo"): his `ghi-giao-dich` skill writes the Notion row after a confirm card. ChillyBank books it within 10 min. |
+| Move money between own accounts | Loại = Chuyển nội bộ, Tài khoản = from, Đến tài khoản = to → booked as a transfer, not spend. |
+| Freelance payment | Thu row, Nguồn thu = Project Vinh, Dự án freelance = the job; the job's "Đã nhận (Tài chính)" adds it up. |
+| Fixed a mistake in Notion | Edits re-sync; a deleted row is deleted here too if nobody edited it in ChillyBank (mass deletions are held back). |
+| Updated Số dư by hand | ChillyBank books one "Đối chiếu số dư Notion" adjustment so the account matches Notion. |
+| Sync or TV push breaks | One in-app notification when it starts failing, one when it recovers (`services/chilly_jobs.py`). |
+
+Lucius reads Notion through the `notion` MCP server (HOMETV bot key, only pages shared with it). He may create rows (`API-post-page`, asks first every time); edits and deletes are not allowed.
+
 ## Family TV hub
 
 ChillyBank is the book; the hub's Tài chính screen shows its snapshot (`services/hub_push.py` → hub `POST /api/finance/snapshot`, contract in the hub's `docs/CONTRACT.md`). The push key is write-only: it can replace that one snapshot and cannot read or change the book. Notion stays an input channel (`services/notion_input.py`).
