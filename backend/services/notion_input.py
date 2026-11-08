@@ -729,10 +729,11 @@ def _reconcile(pages: list[dict], ids: dict) -> int:
         props, ref = _props(page), page["id"]
         account = ledger_service.accounts.find_by_id(ids[ref]) if ref in ids else None
         day = _day(props.get("Cập nhật"))
-        if account is None or day is None:
+        value = props.get("Số dư")
+        # A renamed or retyped Số dư column must not read as 0 and zero every account.
+        if account is None or day is None or not isinstance(value, (int, float)) or isinstance(value, bool):
             continue
-        balance = _num(props.get("Số dư"))
-        balance = -abs(balance) if account.get("type") == "loan" else balance
+        balance = -abs(value) if account.get("type") == "loan" else value
         try:
             reconciled += _reconcile_one(account, ref, balance, day)
         except (OpenNetWorthError, ValueError) as exc:
