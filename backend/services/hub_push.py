@@ -30,8 +30,13 @@ def _envelopes(month: dict) -> tuple[list[dict], dict[str, str]]:
         for c in group.get("categories") or []:
             available = float(c.get("available") or 0)
             allocated = float(c.get("assigned_to_date") or c.get("assigned") or 0)
-            spent = -float(c.get("activity") or 0)
+            # The hub's Đã chi is cumulative, like Tổng phân bổ: what left the envelope since its money arrived.
+            spent = allocated - available if allocated else -float(c.get("activity") or 0)
             status = "neg" if available < 0 else _STATUS.get(str(c.get("status") or ""))
+            for cid in c.get("category_ids") or []:
+                by_category[cid] = c.get("label") or ""
+            if not (allocated or spent or available):
+                continue  # an unused envelope (a fresh book's starters) would only clutter the TV list
             rows.append(
                 {
                     "id": c.get("envelope_id") or c.get("key"),
@@ -47,8 +52,6 @@ def _envelopes(month: dict) -> tuple[list[dict], dict[str, str]]:
                     "note": "",
                 }
             )
-            for cid in c.get("category_ids") or []:
-                by_category[cid] = c.get("label") or ""
     return rows, by_category
 
 

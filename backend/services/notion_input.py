@@ -2,7 +2,7 @@
 
 Rows typed into the Notion finance workspace flow into the book. Nothing is ever written to Notion,
 and nothing created in the book is pushed to it. ``sync_notion_input()`` does nothing without
-``NOTION_TOKEN``. It reads the three data sources in full before it writes anything (a failed read
+``NOTION_TOKEN``. It reads the four data sources in full before it writes anything (a failed read
 leaves the book untouched), then applies them through the services the REST API and Lucius use.
 
 Identity (re-running never duplicates):
@@ -23,14 +23,19 @@ Mapping (Notion property -> ChillyBank):
             so the account reads Số dư after the first sync and every imported row still counts.
 - envelope  Ngăn tiền -> envelope, with a category of the same name (kind expense) that its rows
             are booked under; Nhóm -> envelope group. A rename or regroup in Notion follows; the
-            envelope's categories keep their labels.
+            envelope's categories keep their labels. Tổng phân bổ (Từ quỹ 1 tỷ + Bổ sung từ thu nhập,
+            summed if the formula is empty) becomes the envelope's assignment in the plan's start
+            month, the earliest of the Month table's Kỳ and the first imported row, so that with
+            rollover its available equals Notion's Còn lại. When it changes in Notion that one
+            assignment follows; no other month is touched. Mục tiêu/tháng -> monthly target (one
+            removed in Notion is not removed here).
 - row       Nội dung -> description; Ghi chú -> memo; Ngày -> date; Thu minus Chi -> income or
             expense (a row with neither, such as Chuyển nội bộ, has no single account to book on
             and is skipped); Ngăn tiền -> category; Tài khoản -> account.
 A row with no Tài khoản, or whose account is gone from the book, goes to one cash account named
 "Notion", opened at zero balance so it adds nothing to net worth on the first sync. Everything is
-in VND. Not imported: the month table, the allocation, target and income-source columns, interest
-rates, and deletions made in Notion.
+in VND. Not imported: the rest of the month table, income-source columns, interest rates, and
+deletions made in Notion.
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ SOURCE = "notion"
 CURRENCY = "VND"
 FALLBACK_REF, FALLBACK_NAME = "fallback", "Notion"
 DATA_SOURCES = {
+    "month": "fb106c98-5875-49a8-b3f9-008ae7e6c895",
     "account": "b431cd69-988c-4a78-81f9-214937e2ed82",
     "envelope": "f7b2be42-2ae0-4fa4-8eee-f56415410e17",
     "tx": "b540b4e2-f94e-490f-aea8-760ed047d12d",
@@ -302,6 +308,29 @@ def _category(envelope: dict) -> str:
     return category
 
 
+def _money(envelope: dict, assigned: float, target: float | None, start: str | None) -> bool:
+    """Put Notion's allocation in the plan's start month and its monthly target on the envelope. Only
+    that one month's assignment is touched; whatever is budgeted in any other month is the owner's."""
+    changed = False
+    if start and planning.assignments_store.month_map(start).get(envelope["id"], 0.0) != assigned:
+        planning.apply_budget_change(
+            {"type": "assign", "month": start, "envelope_id": envelope["id"], "amount": assigned}
+        )
+        changed = True
+    now = planning.read_category_targets().get(envelope["id"]) or {}
+    if target and (now.get("type"), now.get("amount")) != ("monthly", target):
+        planning.apply_budget_change(
+            {
+                "type": "set_target",
+                "envelope_id": envelope["id"],
+                "target_type": "monthly",
+                "amount": target,
+            }
+        )
+        changed = True
+    return changed
+
+
 def _retitle(envelope: dict, name: str, group_id: str) -> bool:
     """Follow a rename or regroup made in Notion. Only the envelope moves: its categories keep their
     labels, as when an envelope is renamed in the app."""
@@ -319,7 +348,23 @@ def _retitle(envelope: dict, name: str, group_id: str) -> bool:
     return changed
 
 
-def _envelopes(pages: list[dict], envs: dict, fps: dict) -> tuple[dict, dict]:
+def _allocation(props: dict) -> float:
+    """Tổng phân bổ is a formula (Từ quỹ 1 tỷ + Bổ sung từ thu nhập); if it comes back empty, add the two."""
+    total = props.get("Tổng phân bổ")
+    if not isinstance(total, (int, float)) or isinstance(total, bool):
+        total = _num(props.get("Từ quỹ 1 tỷ")) + _num(props.get("Bổ sung từ thu nhập"))
+    return max(0.0, round(float(total), 2))
+
+
+def _start_month(months: list[dict], txs: list[dict]) -> str | None:
+    """The plan's first month: the earliest Notion month (Kỳ), or an earlier transaction, so that no
+    imported spend falls before the month the allocation sits in."""
+    days = [d for d in (_day(_props(m).get("Kỳ")) for m in months) if d]
+    days += [tx["date"] for tx in txs]
+    return min(days)[:7] if days else None
+
+
+def _envelopes(pages: list[dict], envs: dict, fps: dict, start: str | None) -> tuple[dict, dict]:
     counts, categories = _counts(), {}
     live = {e["id"]: e for e in envelopes_service.all_envelopes() if not e.get("archived")}
     groups = {_key(g["name"]): g["id"] for g in envelopes_service.groups_store.list_ordered()}
@@ -327,6 +372,14 @@ def _envelopes(pages: list[dict], envs: dict, fps: dict) -> tuple[dict, dict]:
         props, ref = _props(page), page["id"]
         name = (props.get("Ngăn tiền") or "").strip()
         group = props.get("Nhóm")
+        assigned, target = _allocation(props), _num(props.get("Mục tiêu/tháng")) or None
+        want = {
+            "name": name,
+            "group": group,
+            "assigned": assigned,
+            "target": target,
+            "start": start,
+        }
         try:
             envelope = live.get(envs.get(ref)) or next(
                 (e for e in live.values() if _key(e["name"]) == _key(name)), None
@@ -341,7 +394,8 @@ def _envelopes(pages: list[dict], envs: dict, fps: dict) -> tuple[dict, dict]:
                 envs[ref] = created["envelope"]["id"]
                 categories[ref] = _category(created["envelope"])
                 counts["created"] += 1
-                fps[ref] = _fp({"name": name, "group": group})
+                _money(created["envelope"], assigned, target, start)
+                fps[ref] = _fp(want)
             else:
                 envs[ref] = envelope["id"]
                 categories[ref] = _category(envelope)
@@ -349,8 +403,11 @@ def _envelopes(pages: list[dict], envs: dict, fps: dict) -> tuple[dict, dict]:
                     counts,
                     fps,
                     ref,
-                    {"name": name, "group": group},
-                    lambda: _retitle(envelope, name, _group_id(group, groups)),
+                    want,
+                    lambda: (
+                        _retitle(envelope, name, _group_id(group, groups))
+                        | _money(envelope, assigned, target, start)
+                    ),
                 )
         except (OpenNetWorthError, ValueError) as exc:
             logger.warning("notion_input: envelope %r not imported: %s", name, exc)
@@ -451,7 +508,8 @@ def _apply(pages: dict[str, list[dict]]) -> dict:
         for tx in txs:
             tx["booked"] = ledger_service.transactions.by_external_ref(SOURCE, tx["ref"])
         accounts, account_ids = _accounts(pages["account"], txs, fps)
-        envelopes, category_ids = _envelopes(pages["envelope"], envs, fps)
+        start = _start_month(pages["month"], txs)
+        envelopes, category_ids = _envelopes(pages["envelope"], envs, fps, start)
         transactions = _transactions(txs, account_ids, category_ids, fps)
         transactions["skipped"] += len(pages["tx"]) - len(txs)
     finally:

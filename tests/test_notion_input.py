@@ -19,6 +19,8 @@ from backend.services import envelopes as envelopes_service
 from backend.services import ledger as ledger_service
 from backend.services import notion_input, planning
 
+MONTH = notion_input.DATA_SOURCES["month"]
+
 ACCOUNT, ENVELOPE, TX = (notion_input.DATA_SOURCES[k] for k in ("account", "envelope", "tx"))
 
 
@@ -72,8 +74,20 @@ def account(page_id, name, loai, balance, updated=None, note="", thanh_khoan=Non
     )
 
 
-def envelope(page_id, name, group):
-    return page(page_id, {"Ngăn tiền": title(name), "Nhóm": select(group)})
+def envelope(page_id, name, group, total=0, target=None):
+    return page(
+        page_id,
+        {
+            "Ngăn tiền": title(name),
+            "Nhóm": select(group),
+            "Tổng phân bổ": formula(total),
+            "Mục tiêu/tháng": number(target),
+        },
+    )
+
+
+def month(page_id, label, start):
+    return page(page_id, {"Tháng": title(label), "Kỳ": when(start)})
 
 
 def row(page_id, name, day, *, chi=0, thu=0, bank=None, env=None, note=""):
@@ -96,7 +110,7 @@ class FakeNotion:
     """Data sources by id, served two rows at a time so pagination is exercised."""
 
     def __init__(self) -> None:
-        self.data = {ACCOUNT: [], ENVELOPE: [], TX: []}
+        self.data = {MONTH: [], ACCOUNT: [], ENVELOPE: [], TX: []}
         self.failing: str | None = None
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -138,9 +152,13 @@ def notion(db_isolated, monkeypatch: pytest.MonkeyPatch) -> FakeNotion:
         account("page-card", "Thẻ Visa", "Thẻ tín dụng", -2_000_000, "2026-11-01"),
         account("page-save", "Sổ tiết kiệm", "Tiết kiệm / Sinh lời", 100_000_000),
     ]
+    fake.data[MONTH] = [
+        month("page-m11", "11/2026", "2026-11-01"),
+        month("page-m10", "10/2026", "2026-10-01"),
+    ]
     fake.data[ENVELOPE] = [
-        envelope("page-food", "Ăn uống", "Thiết yếu"),
-        envelope("page-reserve", "Dự phòng", "Dự phòng"),
+        envelope("page-food", "Ăn uống", "Thiết yếu", total=10_000_000, target=2_000_000),
+        envelope("page-reserve", "Dự phòng", "Dự phòng", total=5_000_000),
     ]
     fake.data[TX] = [
         row("tx-lunch", "Cơm trưa", "2026-11-03", chi=50_000, bank="page-bank", env="page-food"),
@@ -583,3 +601,133 @@ async def test_account_type_follows_loai(
     assert ledger_service.balances()[made["id"]] == (
         -5_000_000 if expected == "loan" else 5_000_000
     )
+
+
+def budget_row(name: str, month_: str) -> dict:
+    groups = planning.budget_month(month_)["groups"]
+    return next(c for g in groups for c in g["categories"] if c["label"] == name)
+
+
+def envelope_id(name: str) -> str:
+    return next(e["id"] for e in envelopes_service.all_envelopes() if e["name"] == name)
+
+
+async def test_allocation_makes_available_equal_notions_con_lai(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+
+    food = budget_row("Ăn uống", "2026-11")
+    # Tổng phân bổ in the start month (10/2026), less what Notion's rows spent from the envelope.
+    assert food["available"] == 10_000_000 - 50_000 - 45_000
+    assert budget_row("Ăn uống", "2026-10")["assigned"] == 10_000_000
+    assert budget_row("Dự phòng", "2026-11")["available"] == 5_000_000 - 100_000
+    assert budget_row("Ăn uống", "2026-11")["assigned"] == 0  # nothing is put in later months
+
+
+async def test_allocation_sums_the_two_columns_when_the_formula_is_empty(
+    notion: FakeNotion,
+) -> None:
+    edit(
+        notion,
+        ENVELOPE,
+        "page-food",
+        **{
+            "Tổng phân bổ": formula(None),
+            "Từ quỹ 1 tỷ": number(3_000_000),
+            "Bổ sung từ thu nhập": number(1_000_000),
+        },
+    )
+
+    await notion_input.sync_notion_input()
+
+    assert budget_row("Ăn uống", "2026-10")["assigned"] == 4_000_000
+
+
+async def test_a_changed_allocation_updates_the_start_month_in_place(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+
+    edit(notion, ENVELOPE, "page-food", **{"Tổng phân bổ": formula(12_000_000)})
+    result = await notion_input.sync_notion_input()
+
+    assert result["envelopes"] == {"created": 0, "updated": 1, "skipped": 1}
+    assert budget_row("Ăn uống", "2026-10")["assigned"] == 12_000_000
+    assert budget_row("Ăn uống", "2026-11")["available"] == 12_000_000 - 95_000
+    assert len([e for e in envelopes_service.all_envelopes() if e["name"] == "Ăn uống"]) == 1
+
+
+async def test_budgeting_in_other_months_survives_a_changed_allocation(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    planning.apply_budget_change(
+        {
+            "type": "assign",
+            "month": "2026-11",
+            "envelope_id": envelope_id("Ăn uống"),
+            "amount": 300_000,
+        }
+    )
+
+    edit(notion, ENVELOPE, "page-food", **{"Tổng phân bổ": formula(12_000_000)})
+    await notion_input.sync_notion_input()
+
+    assert budget_row("Ăn uống", "2026-11")["assigned"] == 300_000
+    assert budget_row("Ăn uống", "2026-10")["assigned"] == 12_000_000
+
+
+async def test_a_local_change_to_the_start_month_stands_while_notion_is_unchanged(
+    notion: FakeNotion,
+) -> None:
+    await notion_input.sync_notion_input()
+    planning.apply_budget_change(
+        {
+            "type": "assign",
+            "month": "2026-10",
+            "envelope_id": envelope_id("Ăn uống"),
+            "amount": 9_000_000,
+        }
+    )
+
+    result = await notion_input.sync_notion_input()
+
+    assert result["envelopes"]["updated"] == 0
+    assert budget_row("Ăn uống", "2026-10")["assigned"] == 9_000_000
+
+
+async def test_the_allocation_goes_in_the_first_imported_month_without_a_month_table(
+    notion: FakeNotion,
+) -> None:
+    notion.data[MONTH] = []
+
+    await notion_input.sync_notion_input()
+
+    assert budget_row("Ăn uống", "2026-11")["assigned"] == 10_000_000
+    assert budget_row("Ăn uống", "2026-11")["available"] == 10_000_000 - 95_000
+
+
+async def test_the_monthly_target_follows_notion(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    food = envelope_id("Ăn uống")
+    assert planning.read_category_targets()[food] == {"type": "monthly", "amount": 2_000_000}
+    assert envelope_id("Dự phòng") not in planning.read_category_targets()
+
+    edit(notion, ENVELOPE, "page-food", **{"Mục tiêu/tháng": number(2_500_000)})
+    await notion_input.sync_notion_input()
+
+    assert planning.read_category_targets()[food] == {"type": "monthly", "amount": 2_500_000}
+
+
+async def test_envelopes_imported_before_allocations_existed_pick_them_up(
+    notion: FakeNotion,
+) -> None:
+    for page_ in notion.data[ENVELOPE]:  # the book as an earlier version of this sync left it
+        page_["properties"]["Tổng phân bổ"] = formula(0)
+        page_["properties"]["Mục tiêu/tháng"] = number(None)
+    await notion_input.sync_notion_input()
+    assert budget_row("Ăn uống", "2026-10")["assigned"] == 0
+
+    notion.data[ENVELOPE] = [
+        envelope("page-food", "Ăn uống", "Thiết yếu", total=10_000_000),
+        envelope("page-reserve", "Dự phòng", "Dự phòng", total=5_000_000),
+    ]
+    result = await notion_input.sync_notion_input()
+
+    assert result["envelopes"] == {"created": 0, "updated": 2, "skipped": 0}
+    assert budget_row("Dự phòng", "2026-10")["assigned"] == 5_000_000
