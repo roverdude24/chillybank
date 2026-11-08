@@ -33,6 +33,12 @@ from backend.db.search_config_store import SearchConfigStore
 _PROVIDER_IDS = ("duckduckgo", "tavily", "perplexity", "serper", "google_pse", "firecrawl")
 
 
+@pytest.fixture(autouse=True)
+def _urls_arrived_from_outside(monkeypatch):
+    """These tests cover the SSRF guard and size caps; URL provenance has its own tests."""
+    monkeypatch.setattr("backend.ai.tools._egress.fetch_allowed", lambda *_a: True)
+
+
 def call(name: str, **inp):
     text, proposed = asyncio.run(execute_tool(name, inp))
     return json.loads(text), proposed

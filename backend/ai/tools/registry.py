@@ -26,6 +26,8 @@ from typing import Any, Awaitable, Callable, Optional, Protocol, Tuple
 
 import jsonschema
 
+from backend.ai.tools import _egress
+
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[dict], Awaitable[Tuple[str, Optional[dict]]]]
@@ -1015,6 +1017,7 @@ async def _dispatch_call(
         _record_call(name, invoked, input_data, "", started, mutated_domains(name), exception=exc)
         _broadcast_write(mutated_domains(name))
         raise
+    _egress.note_inbound(name, text)
     # A self-staging handler (add_transactions/update_transactions and the 13 propose/apply
     # merges) may ITSELF return a paused ``(None, change)`` pair — same sentinel, same
     # contract, produced from inside the handler rather than by ``_permission_gate`` above.
@@ -1146,6 +1149,10 @@ def _permission_gate(
     # Inside ``dispatch`` this is the gate it chose for the call; a direct caller (a test, a
     # script) reads the flag here, and a flag that cannot be read raises.
     _gate = engine()
+    # A model-composed URL on a fetch tool (the ledger-exfiltration shape, ai/tools/_egress.py)
+    # is carded where a card can be shown and refused everywhere else — including on a gate
+    # error, which the legacy gate otherwise fails OPEN.
+    unseen_url = not _egress.fetch_allowed(name, input_data)
     try:
         level = _gate.effective_level(name)
         if level == "blocked":
@@ -1165,9 +1172,15 @@ def _permission_gate(
             _redeeming.set(True)
             return None, _gate.staged_args(entry)
 
+        if unseen_url:
+            if _gate.should_gate_dispatch(name, level="needs_approval"):
+                return _gate.stage_generic(name, input_data), input_data
+            return _egress.unseen_url_refusal(name, input_data), input_data
         if _gate.should_gate_dispatch(name, level=level):
             return _gate.stage_generic(name, input_data), input_data
     except Exception:  # noqa: BLE001 — see docstring
+        if unseen_url:
+            return _egress.unseen_url_refusal(name, input_data), input_data
         return _gate.gate_error(name, input_data)
     return None, input_data
 

