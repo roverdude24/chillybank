@@ -428,7 +428,18 @@ def _tx(page: dict) -> dict | None:
         "memo": props.get("Ghi chú") or "",
         "account": _first(props.get("Tài khoản")),
         "envelope": _first(props.get("Ngăn tiền")),
+        "source": props.get("Nguồn thu"),
+        "funding": props.get("Nguồn tiền"),
     }
+
+
+def _income_category(tx: dict) -> str:
+    """Income has no envelope in Notion; its category is the row's Nguồn thu. An untagged row titled
+    "Lãi …" is interest (the TV hub reads it the same way); anything else untagged is other income."""
+    source = tx.get("source")
+    if not source or source == "Khác":
+        source = "Lãi tiền gửi" if _nfc(tx["description"]).lower().startswith("lãi") else "Thu nhập khác"
+    return categories_service.resolve_category_ref(source) or categories_service.create_category(source, "income")["id"]
 
 
 def _booking(tx: dict, account: str | None, categories: dict) -> dict:
@@ -449,6 +460,10 @@ def _booking(tx: dict, account: str | None, categories: dict) -> dict:
     }
     if not tx["envelope"] or tx["envelope"] in categories:
         row["category"] = categories.get(tx["envelope"])
+    if row["kind"] == "income" and not row.get("category"):
+        row["category"] = _income_category(tx)
+    if tx.get("funding"):
+        row["tags"] = [f"Nguồn: {tx['funding']}"]
     return row
 
 

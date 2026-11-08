@@ -270,16 +270,34 @@ async def test_first_sync_books_accounts_envelopes_and_rows(notion: FakeNotion) 
     assert lunch["external_refs"] == [{"source": "notion", "ref": "tx-lunch"}]
     assert rows["Cà phê"]["category"] == food
     assert rows["Cà phê"]["from_account_id"] == accounts["Thẻ Visa"]["id"]
+    # Untagged income that is not "Lãi …" lands in "Thu nhập khác"; Nguồn thu wins when set.
     assert (rows["Lương"]["kind"], rows["Lương"]["to_amount"], rows["Lương"]["category"]) == (
         "income",
         20_000_000,
-        None,
+        categories_service.resolve_category_ref("Thu nhập khác"),
     )
     assert rows["Quà"]["from_account_id"] == accounts["Notion"]["id"]
     assert (rows["Quà"]["memo"], rows["Quà"]["category"]) == (
         "sinh nhật",
         categories_service.resolve_category_ref("Dự phòng"),
     )
+
+
+async def test_income_is_categorized_by_its_source_and_funding_becomes_a_tag(notion: FakeNotion) -> None:
+    interest = row("tx-interest", "Lãi MoMo Túi Thần Tài", "2026-11-06", thu=90_451, bank="page-bank")
+    sale = row("tx-sale", "Bên mua căn hộ trả phần còn lại", "2026-11-07", thu=10_000_000, bank="page-bank")
+    sale["properties"]["Nguồn thu"] = select("Project Vinh")
+    sale["properties"]["Nguồn tiền"] = select("Tiền bán nhà (của mẹ)")
+    notion.data[TX] += [interest, sale]
+
+    await notion_input.sync_notion_input()
+
+    rows = imported()
+    assert rows["Lãi MoMo Túi Thần Tài"]["category"] == categories_service.resolve_category_ref("Lãi tiền gửi")
+    booked = rows["Bên mua căn hộ trả phần còn lại"]
+    assert booked["category"] == categories_service.resolve_category_ref("Project Vinh")
+    assert booked["tags"] == ["Nguồn: Tiền bán nhà (của mẹ)"]
+    assert categories_service.kind_for(booked["category"]) == "income"
 
 
 async def test_second_sync_changes_nothing(notion: FakeNotion) -> None:
