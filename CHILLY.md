@@ -56,6 +56,13 @@ Leave the two `CHILLY_HUB_*` lines out until the book holds the family's real da
 | House, land, car | owned asset (`property`, `vehicle`), mortgage = `loan` account + commitment |
 | Bank statements | import; Vietnamese headers and dd/mm/yyyy are detected |
 
+## Money flow from Notion
+
+- Budget groups and envelopes are Notion's (Thiết yếu, Nợ, Dự phòng, Công việc, Mục tiêu & đầu tư, Chờ phân loại); the fresh-book starters are removed.
+- Notion income is booked under its Nguồn thu (Lãi tiền gửi, Lương Ánh, Project Vinh, Zenme 1%, Thu nhập khác); Nguồn tiền becomes a `Nguồn: …` tag.
+- 31 payee rules route Vietnamese merchants, bills, AI tools, school fees, card payments and interest from statements, Telegram and email to those envelopes.
+- Rebuild or re-apply: `set -a; . ./.env; set +a; .venv/bin/python scripts/chilly_book_setup.py` (safe to re-run).
+
 ## Family TV hub
 
 ChillyBank is the book; the hub's Tài chính screen shows its snapshot (`services/hub_push.py` → hub `POST /api/finance/snapshot`, contract in the hub's `docs/CONTRACT.md`). The push key is write-only: it can replace that one snapshot and cannot read or change the book. Notion stays an input channel (`services/notion_input.py`).
