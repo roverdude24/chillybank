@@ -117,7 +117,10 @@ def payees() -> list[str]:
 
 
 def notion_mcp() -> str:
-    """Lucius's Notion tools: reads, plus creating rows (a connector tool asks before every call)."""
+    """Lucius's Notion tools: reads run without a card (a card per lookup made chat unusable);
+    creating a row always asks."""
+    from backend.mcp.client_manager import mcp_connector_id
+    from backend.services import tool_permissions
     from backend.db.mcp_client_store import McpClientStore
     from backend.models.mcp_client import McpServerConfig
 
@@ -135,11 +138,16 @@ def notion_mcp() -> str:
         "read_only": False,
         "tool_allowlist": [*NOTION_READ_TOOLS, "API-post-page"],
     }
-    if store.find("notion"):
+    outcome = "updated" if store.find("notion") else "created"
+    if outcome == "updated":
         store.update("notion", fields)
-        return "updated"
-    store.create(McpServerConfig(id="notion", **fields))
-    return "created"
+    else:
+        store.create(McpServerConfig(id="notion", **fields))
+    owner = mcp_connector_id("notion")
+    for tool in NOTION_READ_TOOLS:
+        tool_permissions.set_tool_permission(owner, tool, "always_allow")
+    tool_permissions.set_tool_permission(owner, "API-post-page", "needs_approval")
+    return outcome
 
 
 def lucius_skill() -> str:
