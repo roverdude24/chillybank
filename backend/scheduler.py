@@ -684,6 +684,26 @@ def start() -> None:
     )
     logger.info("scheduler: daily_backup scheduled — daily at 03:30 local")
 
+    # ChillyBank: HNX/UPCoM stocks and domestic gold (services/vn_prices.py), every 15 minutes.
+    from backend.services.hub_push import push_to_hub
+    from backend.services.vn_prices import refresh_vn_prices
+
+    _scheduler.add_job(
+        refresh_vn_prices,
+        trigger=IntervalTrigger(minutes=15),
+        id="vn_prices",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+    # ChillyBank: the family TV's Tài chính snapshot (services/hub_push.py); no-op until configured.
+    _scheduler.add_job(
+        push_to_hub,
+        trigger=IntervalTrigger(minutes=5),
+        id="hub_push",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
     # Boot already listed every server's tools, so the first re-read is a day out.
     _scheduler.add_job(
         _run_mcp_tools_refresh,

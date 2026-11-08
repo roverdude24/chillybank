@@ -1332,6 +1332,8 @@ _ADDED_STARTERS: tuple[str, ...] = (
     "balance-mismatch-tracer",
     # 2026-11-05: the Email finance digest template runs it — logging plus what else needs them.
     "email-finance-digest",
+    # 2026-11-08: Vietnamese banks, wallets, stocks, gold, property and VND conventions.
+    "vietnam-finance",
 )
 
 # ── Built-in starter skills ────────────────────────────────────────────────────

@@ -1113,6 +1113,7 @@ _HOUSE_STANDARD = [
     "onboarding-new-user",
     "subscription-audit",
     "weekly-report",
+    "vietnam-finance",
 ]
 
 
