@@ -686,6 +686,7 @@ def start() -> None:
 
     # ChillyBank: HNX/UPCoM stocks and domestic gold (services/vn_prices.py), every 15 minutes.
     from backend.services.hub_push import push_to_hub
+    from backend.services.notion_input import sync_notion_input
     from backend.services.vn_prices import refresh_vn_prices
 
     _scheduler.add_job(
@@ -702,6 +703,14 @@ def start() -> None:
         id="hub_push",
         replace_existing=True,
         misfire_grace_time=300,
+    )
+    # ChillyBank: Notion Tài chính is an input channel (services/notion_input.py); no-op without NOTION_TOKEN.
+    _scheduler.add_job(
+        sync_notion_input,
+        trigger=IntervalTrigger(minutes=10),
+        id="notion_input",
+        replace_existing=True,
+        misfire_grace_time=600,
     )
 
     # Boot already listed every server's tools, so the first re-read is a day out.

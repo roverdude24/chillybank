@@ -22,17 +22,43 @@ git checkout -b fix/<topic> upstream/main       # give ours back: change, push, 
 
 When an upstream PR merges, delete the `fix/` branch; the next `git merge main` brings it home.
 
-## Fork-only settings (no code)
+## Running it on the Mac
 
-Put these in `.env` at the repo root (gitignored):
+- Edit here (`/Volumes/VINH MAC/VINH's WORKS/OPENNETWORTH`), run from `~/Dev/chillybank` (internal disk). macOS blocks launchd jobs from the external drive, and setup's docs build fails on a path with an apostrophe.
+- Deploy a change: push `chilly`, then `cd ~/Dev/chillybank && git pull && make setup && .venv/bin/onw restart`.
+- Data lives in `~/.open-net-worth/` (internal disk, daily backup at 03:30).
+
+`~/Dev/chillybank/.env` (gitignored):
 
 ```bash
 APP_NAME=ChillyBank
+CHILLY_HUB_URL=https://<home-hub worker URL>   # Tài chính snapshot to the TV, every 5 min
+CHILLY_HUB_PUSH_KEY=<same value as the hub's FINANCE_PUSH_KEY secret>
+NOTION_TOKEN=<Notion integration token>          # Notion Tài chính as an input channel
 ```
+
+Leave the two `CHILLY_HUB_*` lines out until the book holds the family's real data: the first push replaces what the TV shows.
 
 - Base currency: pick **VND** on the first-run screen (it is preselected for Vietnam).
 - Settings → Appearance → number format **1.234.567** gives Vietnamese grouping (`1.250.000 ₫`).
 - Lucius answers in Vietnamese: tell him once, "Luôn trả lời bằng tiếng Việt", and he saves it to memory.
+- Telegram: Connectors → Telegram with a new bot token lets the family log spending by chat.
+
+## Vietnam pack
+
+| Need | How |
+|---|---|
+| Banks, MoMo, ZaloPay, ShopeePay, VNPay, Viettel Money | `cash` accounts; Lucius uses the `vietnam-finance` skill (domains for logos, transfer vs spend) |
+| Tiết kiệm có kỳ hạn | `fixed_deposit` account |
+| HOSE stocks, ETFs | instrument `XXX.VN` (Yahoo, live) |
+| HNX / UPCoM stocks | manual instrument, `price_source_id` `vndirect:<TICKER>`, refreshed every 15 min |
+| SJC gold bar, PNJ ring | manual instrument, `price_source_id` `pnj:SJC` / `pnj:N24K`, VND per lượng at the buy-back price |
+| House, land, car | owned asset (`property`, `vehicle`), mortgage = `loan` account + commitment |
+| Bank statements | import; Vietnamese headers and dd/mm/yyyy are detected |
+
+## Family TV hub
+
+ChillyBank is the book; the hub's Tài chính screen shows its snapshot (`services/hub_push.py` → hub `POST /api/finance/snapshot`, contract in the hub's `docs/CONTRACT.md`). The push key is write-only: it can replace that one snapshot and cannot read or change the book. Notion stays an input channel (`services/notion_input.py`).
 
 ## Changes carried over upstream
 
