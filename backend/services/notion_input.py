@@ -37,11 +37,12 @@ A row with no Tài khoản, or whose account is gone from the book, goes to one 
 in VND. Not imported: the rest of the month table, income-source columns, interest rates.
 
 Deletions: after a complete read, an imported row whose Notion page is gone is deleted here too
-(ledger delete, so it is checkpointed and its identity remembered), unless it was edited here since
-the import; those are kept and counted. If over half the imported rows (or more than 20) vanish at
-once, nothing is deleted. Balances: when an account's Số dư or Cập nhật changes in Notion, the gap
-to the book's balance at Cập nhật is booked as one adjustment "Đối chiếu số dư Notion" (ref
-``bal:<page>:<Cập nhật>``), after the rows are synced so a matching Thu row nets to zero.
+(ledger delete, so it is checkpointed), unless it was edited here since the import; those are kept
+and counted. If over half the imported rows (or more than 20) vanish at once, nothing is deleted.
+Balances: Số dư is the family's truth, so every sync makes each account with a Cập nhật read Số dư
+on that date: the gap is held in one adjustment "Đối chiếu số dư Notion" (ref ``bal:<page>:<Cập
+nhật>``) that is created, moved or removed as rows are typed, changed or deleted. Rows dated before
+Cập nhật are therefore absorbed by it.
 """
 
 from __future__ import annotations
@@ -222,35 +223,6 @@ def _linked_accounts() -> dict:
     }
 
 
-def _counted_transfers(pages: list[dict], txs: list[dict], fps: dict, seen: dict) -> None:
-    """Mark the transfers a Số dư already contains, so they are recorded but not booked.
-
-    An earlier version skipped every Chuyển nội bộ row, so an account it created holds a Starting
-    Balance (Số dư as of its Cập nhật) that already includes any transfer up to then. Booking such a
-    transfer would count it twice. An account is anchored to the Cập nhật its balance was last agreed
-    to: the stored baseline, or on first sight the Cập nhật it has now (a blank one is today). A new
-    transfer dated on or before the anchor of either existing account is already counted. When the
-    pair changed this sync, ``_reconcile`` corrects the balance whichever way, so the transfer is
-    booked; accounts created this sync are opened to count it and have no anchor."""
-    anchor, today, linked = {}, user_today().isoformat(), _linked_accounts()
-    for page in pages:
-        ref = page["id"]
-        if ref not in linked:
-            continue
-        props = _props(page)
-        pair = [_num(props.get("Số dư")), _day(props.get("Cập nhật"))]
-        if ref not in seen:
-            anchor[ref] = pair[1] or today
-        elif seen[ref] == pair:
-            anchor[ref] = pair[1]
-    for tx in txs:
-        if tx["to_account"] and not tx["booked"] and tx["ref"] not in fps:
-            tx["counted"] = any(
-                anchor.get(a) is not None and tx["date"] <= anchor[a]
-                for a in (tx["account"], tx["to_account"])
-            )
-
-
 def _accounts(pages: list[dict], txs: list[dict], fps: dict) -> tuple[dict, dict]:
     counts, ids = _counts(), {}
     by_ref = _linked_accounts()
@@ -263,7 +235,7 @@ def _accounts(pages: list[dict], txs: list[dict], fps: dict) -> tuple[dict, dict
         if _props(page).get("Tài khoản") and (page["id"] in by_ref or page["id"] not in fps)
     }
     for tx in txs:
-        if tx.get("counted") or not (tx["booked"] or tx["ref"] not in fps):  # or deleted here
+        if not (tx["booked"] or tx["ref"] not in fps):  # one deleted here since the import
             continue
         if tx["to_account"]:  # a transfer: out of one account, into the other
             if tx["account"] in known and tx["to_account"] in known:
@@ -571,9 +543,6 @@ def _transactions(txs: list[dict], accounts: dict, categories: dict, fps: dict) 
                 )
             elif ref in fps:  # booked before, deleted here since: it stays deleted
                 counts["skipped"] += 1
-            elif tx.get("counted"):  # already inside an account's Số dư: noted, not booked again
-                fps[ref] = _fp(data)
-                counts["skipped"] += 1
             else:
                 ledger_service.create_transaction(
                     {
@@ -692,44 +661,37 @@ def _adjustment_legs(account: dict, delta: float) -> dict:
     }
 
 
-def _reconcile_one(
-    account: dict, page_ref: str, balance: float, day: str, *, refold: bool = False
-) -> bool:
-    """Make the account read ``balance`` on ``day`` with one adjustment, the row ``ledger.reconcile``
-    books (an ``adjustment`` through ``create_transaction``). ``reconcile`` itself diffs the cleared
-    balance as of today under a fixed description, so it cannot be dated, referenced or idempotent.
-
-    ``refold`` re-checks an adjustment already booked for this pair (rows typed late or deleted since
-    change the gap) and does nothing when there is none. Otherwise the pair is new, and adjustments
-    of this account dated after the new day belong to a Cập nhật it no longer has: they are removed,
-    or a Cập nhật corrected backwards would leave the old one beside the new."""
+def _reconcile_one(account: dict, page_ref: str, balance: float, day: str) -> bool:
+    """Make the account read ``balance`` on ``day`` with at most one adjustment, the row
+    ``ledger.reconcile`` books (an ``adjustment`` through ``create_transaction``). ``reconcile``
+    itself diffs the cleared balance as of today under a fixed description, so it cannot be dated,
+    referenced or idempotent. The adjustment for ``day`` is created, moved by the gap, or removed
+    when the rows now explain Số dư. Adjustments of this account dated after ``day`` belong to a
+    Cập nhật it no longer has and are removed, or a Cập nhật corrected backwards would leave the
+    old one beside the new."""
     txns = ledger_service.transactions.all()
     opened = ledger_service.opening_date(account, txns)
     day = max(day, opened or day)  # before its tracking start the book holds nothing to compare
     ref = f"{BALANCE_PREFIX}{page_ref}:{day}"
+    prefix = f"{BALANCE_PREFIX}{page_ref}:"
+    later = [
+        t["id"]
+        for t in txns
+        if not t.get("deleted")
+        and any(
+            e.get("source") == SOURCE
+            and e["ref"].startswith(prefix)
+            and e["ref"][len(prefix) :] > day
+            for e in t.get("external_refs") or []
+        )
+    ]
+    if later:
+        ledger_service.bulk_delete_transactions(later, reject_identities=False)
+        txns = ledger_service.transactions.all()
     existing = ledger_service.transactions.by_external_ref(SOURCE, ref)
-    if refold and existing is None:
-        return False
-    if not refold:
-        prefix = f"{BALANCE_PREFIX}{page_ref}:"
-        later = [
-            t["id"]
-            for t in txns
-            if not t.get("deleted")
-            and any(
-                e.get("source") == SOURCE
-                and e["ref"].startswith(prefix)
-                and e["ref"][len(prefix) :] > day
-                for e in t.get("external_refs") or []
-            )
-        ]
-        if later:
-            ledger_service.bulk_delete_transactions(later, reject_identities=False)
-            txns = ledger_service.transactions.all()
-    current = ledger_service.account_balance_as_of(account, day, txns, opened)
-    delta = round(balance - current, 2)
+    delta = round(balance - ledger_service.account_balance_as_of(account, day, txns, opened), 2)
     if abs(delta) < 1:
-        return False
+        return bool(later)
     if existing is not None:  # the gap moved: change that adjustment by it
         signed = (existing.get("to_amount") or 0.0) - (existing.get("from_amount") or 0.0)
         total = round(signed + delta, 2)
@@ -757,32 +719,24 @@ def _reconcile_one(
     return True
 
 
-def _reconcile(pages: list[dict], ids: dict, seen: dict) -> int:
+def _reconcile(pages: list[dict], ids: dict) -> int:
     """Keep each account at Notion's Số dư. The family types a new Số dư (and Cập nhật) by hand, and
-    rows without a single account (Chuyển nội bộ) never reach the book, so balances drift. When the
-    pair changes, the difference at Cập nhật is booked once. While an adjustment exists for the
-    current pair it is re-checked every sync, so a row typed late (or deleted) that falls before
-    Cập nhật changes the adjustment instead of the balance. The first sight of an account only
-    records the pair; its opening already agrees with it."""
-    today, reconciled = user_today().isoformat(), 0
+    a row typed late or deleted shifts what the book holds at that date, so every sync makes the
+    balance at Cập nhật equal Số dư: one adjustment "Đối chiếu số dư Notion" is created, moved or
+    removed to close the gap. An account with no Cập nhật has nothing to be dated to and is left."""
+    reconciled = 0
     for page in pages:
         props, ref = _props(page), page["id"]
         account = ledger_service.accounts.find_by_id(ids[ref]) if ref in ids else None
-        if account is None:
+        day = _day(props.get("Cập nhật"))
+        if account is None or day is None:
             continue
-        pair = [_num(props.get("Số dư")), _day(props.get("Cập nhật"))]
-        if ref not in seen:
-            seen[ref] = pair
-            continue
-        balance = -abs(pair[0]) if account.get("type") == "loan" else pair[0]
+        balance = _num(props.get("Số dư"))
+        balance = -abs(balance) if account.get("type") == "loan" else balance
         try:
-            reconciled += _reconcile_one(
-                account, ref, balance, pair[1] or today, refold=seen[ref] == pair
-            )
+            reconciled += _reconcile_one(account, ref, balance, day)
         except (OpenNetWorthError, ValueError) as exc:
             logger.warning("notion_input: %r not reconciled: %s", account.get("name"), exc)
-            continue
-        seen[ref] = pair
     return reconciled
 
 
@@ -791,19 +745,17 @@ def _apply(pages: dict[str, list[dict]]) -> dict:
     doc = _links.get() or {}
     before = copy.deepcopy(doc)
     fps, envs = doc.setdefault("fp", {}), doc.setdefault("env", {})
-    balances = doc.setdefault("bal", {})
     try:
         txs = [tx for tx in map(_tx, pages["tx"]) if tx]
         for tx in txs:
             tx["booked"] = ledger_service.transactions.by_external_ref(SOURCE, tx["ref"])
-        _counted_transfers(pages["account"], txs, fps, balances)
         accounts, account_ids = _accounts(pages["account"], txs, fps)
         start = _start_month(pages["month"], txs)
         envelopes, category_ids = _envelopes(pages["envelope"], envs, fps, start)
         transactions = _transactions(txs, account_ids, category_ids, fps)
         transactions["skipped"] += len(pages["tx"]) - len(txs)
         transactions |= _vanished({p["id"] for p in pages["tx"]}, fps)
-        accounts["reconciled"] = _reconcile(pages["account"], account_ids, balances)
+        accounts["reconciled"] = _reconcile(pages["account"], account_ids)
     finally:
         if doc != before:
             _links.save(doc)

@@ -181,7 +181,9 @@ def imported() -> dict:
     return {
         t["description"]: t
         for t in ledger_service.transactions.all()
-        if t.get("external_refs") and not t.get("deleted")
+        if t.get("external_refs")
+        and not t.get("deleted")
+        and t.get("description") != notion_input.BALANCE_DESCRIPTION
     }
 
 
@@ -383,8 +385,9 @@ async def test_an_edited_row_updates_in_place(notion: FakeNotion) -> None:
     }
     edited = imported()["Cơm trưa + nước"]
     assert edited["id"] == lunch["id"]
+    assert balance_of("Ngân hàng") == 10_000_000  # Số dư of 10/11 wins: +15k adjustment absorbs it
     assert (edited["from_amount"], edited["memo"]) == (65_000, "văn phòng")
-    assert len(ledger_service.transactions.all()) == count
+    assert len(ledger_service.transactions.all()) == count + len(adjustments())  # no row duplicated
 
 
 async def test_a_chi_retyped_as_thu_flips_the_row(notion: FakeNotion) -> None:
@@ -902,14 +905,12 @@ async def test_a_deleted_row_does_not_count_against_the_guard_twice(notion: Fake
 # ── Số dư ──
 
 
-async def test_first_sight_of_an_account_only_records_its_so_du(notion: FakeNotion) -> None:
+async def test_an_account_is_reconciled_on_first_sight(notion: FakeNotion) -> None:
     first = await notion_input.sync_notion_input()
-    assert first["accounts"]["reconciled"] == 0 and adjustments() == []
+    assert first["accounts"]["reconciled"] == 0 and adjustments() == []  # just opened at Số dư
 
     state = NamespacedSettingsStore("notion_input")
-    doc = state.get()
-    doc.pop("bal")  # a book synced before balances were followed
-    state.save(doc)
+    state.save({k: v for k, v in state.get().items() if k != "bal"})  # a book from an older sync
     edit(
         notion,
         ACCOUNT,
@@ -918,8 +919,9 @@ async def test_first_sight_of_an_account_only_records_its_so_du(notion: FakeNoti
     )
     second = await notion_input.sync_notion_input()
 
-    assert second["accounts"]["reconciled"] == 0 and adjustments() == []
-    assert balance_of("Ngân hàng") == 10_000_000
+    assert second["accounts"]["reconciled"] == 1
+    assert [a["to_amount"] for a in adjustments()] == [500_000]
+    assert balance_of("Ngân hàng") == 10_500_000
 
 
 async def test_a_raised_so_du_with_no_row_is_booked_once_at_cap_nhat(notion: FakeNotion) -> None:
@@ -1120,16 +1122,16 @@ async def test_upgrade_does_not_count_old_transfers_twice(notion: FakeNotion, mo
 
     result = await notion_input.sync_notion_input()
 
-    # The 8/11 transfer is inside both Số dư; the 15/11 one is after them and is real.
-    assert set(imported()) >= {"Gửi thêm"} and "Rút tiền" not in imported()
-    assert result["transactions"]["created"] == 1
+    # Both transfers are booked; the 8/11 one is absorbed by the Số dư adjustments, the 15/11 one moves money.
+    assert set(imported()) >= {"Gửi thêm", "Rút tiền"}
+    assert result["transactions"]["created"] == 2
     assert (balance_of("Ngân hàng"), balance_of("Sổ tiết kiệm")) == (9_500_000, 100_500_000)
     again = await notion_input.sync_notion_input()
     assert again["transactions"]["created"] == 0
     assert (balance_of("Ngân hàng"), balance_of("Sổ tiết kiệm")) == (9_500_000, 100_500_000)
 
 
-async def test_a_transfer_dated_before_a_known_cap_nhat_is_not_booked_again(
+async def test_a_transfer_dated_before_a_known_cap_nhat_is_absorbed_by_the_adjustment(
     notion: FakeNotion,
 ) -> None:
     await notion_input.sync_notion_input()
@@ -1139,8 +1141,8 @@ async def test_a_transfer_dated_before_a_known_cap_nhat_is_not_booked_again(
     )
     await notion_input.sync_notion_input()
 
-    assert "Rút tiền" not in imported()
-    assert balance_of("Ngân hàng") == 10_000_000  # Số dư of 10/11 already says so
+    assert "Rút tiền" in imported()
+    assert balance_of("Ngân hàng") == 10_000_000  # Số dư of 10/11 still says so
 
 
 async def test_a_row_restored_in_notion_comes_back(notion: FakeNotion) -> None:
@@ -1251,7 +1253,7 @@ async def test_a_new_account_funded_from_an_account_deleted_here_reads_its_so_du
     assert balance_of("Ví MoMo") == 1_000_000  # Notion: 1M
 
 
-async def test_a_new_account_is_opened_to_its_so_du_when_its_transfer_is_already_counted(
+async def test_a_new_account_is_opened_to_its_so_du_and_its_transfer_is_booked(
     notion: FakeNotion,
 ) -> None:
     await notion_input.sync_notion_input()
@@ -1264,5 +1266,209 @@ async def test_a_new_account_is_opened_to_its_so_du_when_its_transfer_is_already
     )
     await notion_input.sync_notion_input()
 
-    assert "Nạp ví" not in imported()  # inside the bank's Số dư of 10/11
+    assert "Nạp ví" in imported()  # booked; the bank's Số dư of 10/11 absorbs it
     assert (balance_of("Ví MoMo"), balance_of("Ngân hàng")) == (1_000_000, 10_000_000)
+
+
+# ── Re-review: Số dư is always followed ──
+
+
+def _balances(*names: str) -> dict:
+    return {name: balance_of(name) for name in names}
+
+
+def _xfer(day: str, ref: str = "tx-xfer") -> dict:
+    return row(ref, "Gửi tiết kiệm", day, moved=1_000_000, bank="page-bank", to="page-save")
+
+
+async def test_n1_late_transfer_reaches_the_account_whose_so_du_predates_it(
+    notion: FakeNotion,
+) -> None:
+    tracked_from_november(notion)  # Sổ tiết kiệm: 100M as of 01/11; Ngân hàng: 10M as of 10/11
+    await notion_input.sync_notion_input()
+    notion.data[TX].append(_xfer("2026-11-08"))  # typed after the bank's Số dư of 10/11 was set
+
+    await notion_input.sync_notion_input()
+
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {
+        "Ngân hàng": 10_000_000,
+        "Sổ tiết kiệm": 101_000_000,
+    }
+
+
+async def test_n1_fresh_import_of_the_same_state(notion: FakeNotion) -> None:
+    tracked_from_november(notion)
+    notion.data[TX].append(_xfer("2026-11-08"))
+    await notion_input.sync_notion_input()
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {
+        "Ngân hàng": 10_000_000,
+        "Sổ tiết kiệm": 101_000_000,
+    }
+
+
+async def test_n1_so_du_typed_from_the_bank_app_then_the_transfer(notion: FakeNotion) -> None:
+    tracked_from_november(notion)
+    await notion_input.sync_notion_input()
+    edit(
+        notion, ACCOUNT, "page-bank", **{"Số dư": number(9_000_000), "Cập nhật": when("2026-11-12")}
+    )
+    await notion_input.sync_notion_input()  # -1M adjustment on the bank
+    notion.data[TX].append(_xfer("2026-11-11"))  # where that 1M went
+
+    await notion_input.sync_notion_input()
+
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {
+        "Ngân hàng": 9_000_000,
+        "Sổ tiết kiệm": 101_000_000,
+    }
+
+
+async def test_n1_new_wallet_whose_so_du_predates_its_top_up(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    notion.data[ACCOUNT].append(account("page-momo", "Ví MoMo", "Ví điện tử", 0, "2026-11-01"))
+    notion.data[TX].append(
+        row("tx-topup", "Nạp ví", "2026-11-05", moved=1_000_000, bank="page-bank", to="page-momo")
+    )
+
+    await notion_input.sync_notion_input()
+
+    assert _balances("Ngân hàng", "Ví MoMo") == {"Ngân hàng": 10_000_000, "Ví MoMo": 1_000_000}
+
+
+async def test_n1_wallet_fresh_import(notion: FakeNotion) -> None:
+    notion.data[ACCOUNT].append(account("page-momo", "Ví MoMo", "Ví điện tử", 0, "2026-11-01"))
+    notion.data[TX].append(
+        row("tx-topup", "Nạp ví", "2026-11-05", moved=1_000_000, bank="page-bank", to="page-momo")
+    )
+    await notion_input.sync_notion_input()
+    assert _balances("Ngân hàng", "Ví MoMo") == {"Ngân hàng": 10_000_000, "Ví MoMo": 1_000_000}
+
+
+# ── N2: a counted transfer is frozen; a later correction in Notion never applies ──
+
+
+async def test_n2_counted_transfer_with_its_date_corrected_is_booked(notion: FakeNotion) -> None:
+    tracked_from_november(notion)
+    await notion_input.sync_notion_input()
+    notion.data[TX].append(_xfer("2026-11-08"))
+    await notion_input.sync_notion_input()  # counted: inside the bank's Số dư of 10/11
+
+    edit(notion, TX, "tx-xfer", **{"Ngày": when("2026-11-18")})  # typo: it happened on the 18th
+    await notion_input.sync_notion_input()
+
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {
+        "Ngân hàng": 9_000_000,
+        "Sổ tiết kiệm": 101_000_000,
+    }
+
+
+async def test_n2_fresh_import_of_the_corrected_state(notion: FakeNotion) -> None:
+    tracked_from_november(notion)
+    notion.data[TX].append(_xfer("2026-11-18"))
+    await notion_input.sync_notion_input()
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {
+        "Ngân hàng": 9_000_000,
+        "Sổ tiết kiệm": 101_000_000,
+    }
+
+
+# ── N3 ──
+
+
+async def test_n3_upgrade_after_so_du_moved_under_the_previous_version(
+    notion: FakeNotion, monkeypatch
+) -> None:
+    old = _previous_version(monkeypatch)
+    edit(notion, ACCOUNT, "page-save", **{"Cập nhật": when("2026-11-10")})
+    old._apply(
+        {k: list(notion.data[v]) for k, v in notion_input.DATA_SOURCES.items()}
+    )  # opened: 10M / 100M as of 10/11
+    # While the previous version ran: 1M moved on 12/11, both Số dư retyped on 15/11.
+    notion.data[TX].append(_xfer("2026-11-12"))
+    edit(
+        notion, ACCOUNT, "page-bank", **{"Số dư": number(9_000_000), "Cập nhật": when("2026-11-15")}
+    )
+    edit(
+        notion,
+        ACCOUNT,
+        "page-save",
+        **{"Số dư": number(101_000_000), "Cập nhật": when("2026-11-15")},
+    )
+    old._apply(
+        {k: list(notion.data[v]) for k, v in notion_input.DATA_SOURCES.items()}
+    )  # it skipped the transfer and ignored Số dư
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {
+        "Ngân hàng": 10_000_000,
+        "Sổ tiết kiệm": 100_000_000,
+    }
+
+    await notion_input.sync_notion_input()  # first sync on bb517627
+
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {  # Notion, and a fresh import
+        "Ngân hàng": 9_000_000,
+        "Sổ tiết kiệm": 101_000_000,
+    }
+
+
+# ── N4: the re-check stops for good once the adjustment nets to zero ──
+
+
+async def test_n4_row_moved_off_the_account_after_its_gap_closed(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    edit(
+        notion, ACCOUNT, "page-bank", **{"Số dư": number(9_800_000), "Cập nhật": when("2026-11-12")}
+    )
+    await notion_input.sync_notion_input()  # -200k adjustment
+    notion.data[TX].append(row("tx-late", "Mua sắm", "2026-11-11", chi=200_000, bank="page-bank"))
+    await (
+        notion_input.sync_notion_input()
+    )  # the late row explains it: adjustment nets to 0, deleted
+    assert balance_of("Ngân hàng") == 9_800_000 and adjustments() == []
+
+    edit(notion, TX, "tx-late", **{"Tài khoản": relation("page-card")})  # it was the card
+    await notion_input.sync_notion_input()
+
+    assert balance_of("Ngân hàng") == 9_800_000  # Notion: 9.8M; a fresh import reads 9.8M
+
+
+async def test_n4_same_move_while_the_adjustment_is_not_yet_zero(notion: FakeNotion) -> None:
+    await notion_input.sync_notion_input()
+    edit(
+        notion, ACCOUNT, "page-bank", **{"Số dư": number(9_800_000), "Cập nhật": when("2026-11-12")}
+    )
+    await notion_input.sync_notion_input()
+    notion.data[TX].append(row("tx-late", "Mua sắm", "2026-11-11", chi=150_000, bank="page-bank"))
+    await notion_input.sync_notion_input()  # adjustment -50k remains
+    edit(notion, TX, "tx-late", **{"Tài khoản": relation("page-card")})
+    await notion_input.sync_notion_input()
+    assert balance_of("Ngân hàng") == 9_800_000  # the re-check covers it here
+
+
+async def test_n5_a_restored_transfer_comes_back(notion: FakeNotion) -> None:
+    tracked_from_november(notion)  # Sổ tiết kiệm 100M as of 01/11
+    await notion_input.sync_notion_input()
+    # Row and the bank's new Số dư typed in the same ten minutes (the skill's order).
+    xfer = row(
+        "tx-xfer", "Gửi tiết kiệm", "2026-11-11", moved=1_000_000, bank="page-bank", to="page-save"
+    )
+    notion.data[TX].append(xfer)
+    edit(
+        notion, ACCOUNT, "page-bank", **{"Số dư": number(9_000_000), "Cập nhật": when("2026-11-12")}
+    )
+    await notion_input.sync_notion_input()
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {
+        "Ngân hàng": 9_000_000,
+        "Sổ tiết kiệm": 101_000_000,
+    }
+
+    notion.data[TX].remove(xfer)  # deleted by mistake...
+    gone = await notion_input.sync_notion_input()
+    assert gone["transactions"]["deleted"] == 1
+    notion.data[TX].append(xfer)  # ...and restored: nothing else changed
+    await notion_input.sync_notion_input()
+
+    assert "Gửi tiết kiệm" in imported()
+    assert _balances("Ngân hàng", "Sổ tiết kiệm") == {
+        "Ngân hàng": 9_000_000,
+        "Sổ tiết kiệm": 101_000_000,
+    }
