@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1fb8a6"/>
+      <stop offset="1" stop-color="#0b4f6c"/>
+    </linearGradient>
+    <linearGradient id="coin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe08a"/>
+      <stop offset="1" stop-color="#f2a93b"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- coin stack -->
+  <g fill="#c9822a">
+    <rect x="292" y="640" width="440" height="70" rx="35"/>
+    <rect x="292" y="560" width="440" height="70" rx="35"/>
+  </g>
+  <g fill="url(#coin)">
+    <rect x="292" y="628" width="440" height="58" rx="29"/>
+    <rect x="292" y="548" width="440" height="58" rx="29"/>
+  </g>
+  <!-- top coin with dong sign -->
+  <circle cx="512" cy="400" r="176" fill="#c9822a"/>
+  <circle cx="512" cy="388" r="176" fill="url(#coin)"/>
+  <circle cx="512" cy="388" r="138" fill="none" stroke="#e39a32" stroke-width="14"/>
+  <text x="512" y="452" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="200" fill="#a8641b">₫</text>
+  <!-- chilly snowflake sparkle -->
+  <g stroke="#ffffff" stroke-width="22" stroke-linecap="round" transform="translate(735 250)">
+    <line x1="0" y1="-62" x2="0" y2="62"/>
+    <line x1="-54" y1="-31" x2="54" y2="31"/>
+    <line x1="-54" y1="31" x2="54" y2="-31"/>
+  </g>
+</svg>

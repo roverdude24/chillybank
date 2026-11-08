@@ -44,6 +44,11 @@ Leave the two `CHILLY_HUB_*` lines out until the book holds the family's real da
 - Lucius answers in Vietnamese: tell him once, "Luôn trả lời bằng tiếng Việt", and he saves it to memory.
 - Telegram: Connectors → Telegram with a new bot token lets the family log spending by chat.
 
+### Mac apps
+
+- **ChillyBank** (`/Applications/ChillyBank.app`, stable): a Safari web app (File → Add to Dock) on the stable runtime, `http://127.0.0.1:8080`. Icon: `frontend/public/chillybank-icon.svg`.
+- **ChillyBank Dev** (`ChillyBank Dev.app` in this folder, gitignored, DEV badge): runs `scripts/chillybank-dev.sh`, which starts this checkout on port 8081 with `--reload` if it isn't running, then opens its window. It uses a copy of the book in `~/.chillybank-dev` (`.env` here sets `DATA_DIR`/`CACHE_DIR`/`LOGS_DIR`). It has no TV push keys, so it never touches the TV. Refresh the copy: stop port 8081, then `sqlite3 ~/.open-net-worth/data/onw.db ".backup '$HOME/.chillybank-dev/data/onw.db'"`. Frontend edits need `cd frontend && npm run build`.
+
 ## Vietnam pack
 
 | Need | How |

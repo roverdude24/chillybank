@@ -168,3 +168,6 @@ qa/artifacts/
 /docs/security/
 /docs/launch/
 /.design-sync/
+
+# local Mac launcher for the dev checkout
+/ChillyBank Dev.app/
